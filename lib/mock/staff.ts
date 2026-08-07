@@ -56,6 +56,9 @@ export const STAFF_MEMBERS: StaffMember[] = NAMES.map((person, i) => {
   };
 });
 
+// SEAM: replace with the authenticated staff session (whoami / auth context)
+export const CURRENT_STAFF = STAFF_MEMBERS[0];
+
 export const ROLE_CARDS: Array<{ role: StaffRole; who: string; can: string; cannot: string }> = [
   {
     role: "Super admin",

@@ -167,6 +167,42 @@ export interface AuditBeforeAfterField {
 }
 
 // ---------------------------------------------------------------------------
+// Desk overview (screen 2)
+// ---------------------------------------------------------------------------
+
+export interface DeskTrend {
+  label: string;
+  tone: "gain" | "loss";
+}
+
+export interface DeskSummary {
+  totalUsers: number;
+  totalUsersTrend: DeskTrend;
+  kycApprovalRate: string; // "94.2%"
+  kycApprovalTrend: DeskTrend;
+  pendingKyc: number;
+  pendingKycTrend: DeskTrend;
+  activeOrders: number;
+  activeOrdersTrend: DeskTrend;
+}
+
+/** Today's intraday transaction volume — a desk-level rollup, not summed
+ * client-side from the transaction log (see SEAM in lib/mock/overview.ts). */
+export interface TodayVolume {
+  amount: string;
+  change: DeskTrend;
+  /** Oldest → newest, one point per trading hour, for the BalancePanel sparkline. */
+  series: number[];
+}
+
+/** A bounded preview of a longer list, plus the true total count — mirrors
+ * how a paginated endpoint reports its own count via response metadata. */
+export interface OverviewPanel<T> {
+  items: T[];
+  total: number;
+}
+
+// ---------------------------------------------------------------------------
 // Staff and roles (screen 8)
 // ---------------------------------------------------------------------------
 

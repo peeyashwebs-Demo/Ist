@@ -41,7 +41,7 @@ function pad(n: number, len = 5) {
   return String(n).padStart(len, "0");
 }
 
-function money(n: number) {
+export function money(n: number) {
   return `₦${n.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
@@ -166,4 +166,82 @@ export function getUsers() {
 // SEAM: replace with GET /api/admin/users/:id
 export function getUserById(id: string) {
   return USERS.find((u) => u.id === id);
+}
+
+export interface KycAutoDecision {
+  status: KycStatus;
+  label: string;
+  confidence: string;
+  summary: string;
+}
+
+const AUTO_DECISION_COPY: Record<KycStatus, { label: string; summary: string }> = {
+  approved: { label: "Auto-approved", summary: "All automated checks cleared with no flags; no manual review was required." },
+  review: { label: "Needs review", summary: "Automated checks could not reach a confident decision, so this case is queued for a KYC reviewer." },
+  pending: { label: "Pending checks", summary: "Documents have been received but automated verification hasn't completed yet." },
+  rejected: { label: "Auto-rejected", summary: "Automated checks found a document or identity mismatch and declined the submission." },
+  expired: { label: "Expired", summary: "This client's verification documents have expired and need to be resubmitted." },
+};
+
+// SEAM: replace with GET /api/admin/users/:id/kyc-decision
+export function getKycAutoDecision(user: User): KycAutoDecision {
+  const seed = Number(user.id.replace(/\D/g, "")) || 1;
+  const copy = AUTO_DECISION_COPY[user.kycStatus];
+  return {
+    status: user.kycStatus,
+    label: copy.label,
+    confidence: `${88 + (seed % 11)}.${seed % 10}%`,
+    summary: copy.summary,
+  };
+}
+
+export interface UserSummaryTrend {
+  label: string;
+  tone: "gain" | "loss";
+}
+
+export interface UserSummary {
+  cashBalance: string;
+  lifetimeDeposits: string;
+  ordersLast30: number;
+  portfolioTrend: UserSummaryTrend;
+  ordersTrend?: UserSummaryTrend;
+}
+
+function parseCurrency(v: string) {
+  return Number(v.replace(/[^\d.-]/g, "")) || 0;
+}
+
+// SEAM: replace with GET /api/admin/users/:id/summary
+export function getUserSummary(user: User): UserSummary {
+  const seed = Number(user.id.replace(/\D/g, "")) || 1;
+  const portfolio = parseCurrency(user.portfolioValue);
+  const cash = Math.round(portfolio * (0.06 + (seed % 9) / 100));
+
+  const depositedOnRecord = user.transactions
+    .filter((t) => t.type === "Deposit")
+    .reduce((sum, t) => sum + parseCurrency(t.amount), 0);
+  const lifetimeDeposits = Math.round(depositedOnRecord + portfolio * (0.4 + (seed % 5) / 20));
+
+  const ordersLast30 = user.transactions.filter((t) => t.type === "Buy" || t.type === "Sell").length;
+
+  const portfolioTrendPct = Number((((seed % 13) - 6) / 2).toFixed(1));
+  const ordersDelta = (seed % 7) - 3;
+
+  return {
+    cashBalance: money(cash),
+    lifetimeDeposits: money(lifetimeDeposits),
+    ordersLast30,
+    portfolioTrend: {
+      label: `${portfolioTrendPct >= 0 ? "+" : ""}${portfolioTrendPct}% this month`,
+      tone: portfolioTrendPct >= 0 ? "gain" : "loss",
+    },
+    ordersTrend:
+      ordersDelta === 0
+        ? undefined
+        : {
+            label: `${ordersDelta > 0 ? "+" : ""}${ordersDelta} vs last month`,
+            tone: ordersDelta >= 0 ? "gain" : "loss",
+          },
+  };
 }
