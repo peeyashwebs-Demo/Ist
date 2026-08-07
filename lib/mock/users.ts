@@ -116,10 +116,10 @@ function makeKycFile(seed: number, status: KycStatus): UserKycFile {
     };
   });
   const checks: KycCheck[] = [
-    { label: "Name matches BVN", value: status === "rejected" ? "No match" : "Match" },
-    { label: "Face match score", value: `${94 + (seed % 5)}.${seed % 10}%` },
-    { label: "Address in country", value: "Nigeria" },
-    { label: "Sanctions / PEP", value: "No hits" },
+    { label: "Name matches BVN record", value: status === "rejected" ? "No match" : "Exact" },
+    { label: "Face match score", value: `0.${94 + (seed % 5)}` },
+    { label: "Address in country", value: "Yes" },
+    { label: "Sanctions and PEP screen", value: status === "review" ? "Flagged" : "Clear" },
   ];
   return {
     bvn: `221${pad(seed * 3, 7)}`,
@@ -173,6 +173,8 @@ export interface KycAutoDecision {
   label: string;
   confidence: string;
   summary: string;
+  clearedAt?: string;
+  confirmedBy?: string;
 }
 
 const AUTO_DECISION_COPY: Record<KycStatus, { label: string; summary: string }> = {
@@ -187,12 +189,19 @@ const AUTO_DECISION_COPY: Record<KycStatus, { label: string; summary: string }> 
 export function getKycAutoDecision(user: User): KycAutoDecision {
   const seed = Number(user.id.replace(/\D/g, "")) || 1;
   const copy = AUTO_DECISION_COPY[user.kycStatus];
-  return {
+  const decision: KycAutoDecision = {
     status: user.kycStatus,
     label: copy.label,
     confidence: `${88 + (seed % 11)}.${seed % 10}%`,
     summary: copy.summary,
   };
+  if (user.kycStatus === "approved") {
+    const hh = String(8 + (seed % 9)).padStart(2, "0");
+    const mm = String((seed * 7) % 60).padStart(2, "0");
+    decision.clearedAt = `${dateAt(30 + seed)} at ${hh}:${mm}`;
+    decision.confirmedBy = `${FIRST_NAMES[(seed + 2) % FIRST_NAMES.length]} ${LAST_NAMES[(seed + 2) % LAST_NAMES.length]}`;
+  }
+  return decision;
 }
 
 export interface UserSummaryTrend {

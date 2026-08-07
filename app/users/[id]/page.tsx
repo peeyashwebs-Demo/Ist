@@ -350,7 +350,16 @@ export default function UserDetailPage() {
               </span>
               {kycDecision ? <StatusPill status={kycDecision.status} label={kycDecision.label} /> : null}
               {kycDecision ? (
-                <p style={{ font: "var(--text-body)", color: "var(--ink-2)", margin: 0 }}>{kycDecision.summary}</p>
+                <p style={{ font: "var(--text-body)", color: "var(--ink-2)", margin: 0 }}>
+                  {kycDecision.clearedAt && kycDecision.confirmedBy ? (
+                    <>
+                      Cleared by the verification service on {kycDecision.clearedAt}. Confirmed by{" "}
+                      {kycDecision.confirmedBy} the same day.
+                    </>
+                  ) : (
+                    kycDecision.summary
+                  )}
+                </p>
               ) : null}
             </div>
 
