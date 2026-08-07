@@ -345,10 +345,12 @@ export default function UserDetailPage() {
 
           <div style={{ background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-card)", padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              <span style={{ font: "var(--text-label)", letterSpacing: "var(--track-label)", textTransform: "uppercase", color: "var(--ink-3)" }}>
-                Automated decision
-              </span>
-              {kycDecision ? <StatusPill status={kycDecision.status} label={kycDecision.label} /> : null}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                <span style={{ font: "var(--text-label)", letterSpacing: "var(--track-label)", textTransform: "uppercase", color: "var(--ink-3)" }}>
+                  Automated decision
+                </span>
+                {kycDecision ? <StatusPill status={kycDecision.status} label={kycDecision.label} /> : null}
+              </div>
               {kycDecision ? (
                 <p style={{ font: "var(--text-body)", color: "var(--ink-2)", margin: 0 }}>
                   {kycDecision.clearedAt && kycDecision.confirmedBy ? (
