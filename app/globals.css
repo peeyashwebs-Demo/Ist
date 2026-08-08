@@ -282,3 +282,24 @@ a:hover {
   text-transform: uppercase;
   color: var(--ink-3);
 }
+
+/* Form controls — focus ring swaps hairline for ink, nothing fades. */
+.k-input:focus,
+.k-select:focus {
+  border-color: var(--border-focus);
+  box-shadow: var(--focus-ring);
+  outline: none;
+}
+.k-select option {
+  color: var(--ink);
+}
+
+/* Modal enter — transform only, 360ms, one easing curve. */
+@keyframes k-modal-in {
+  from {
+    transform: translateY(8px) scale(0.99);
+  }
+  to {
+    transform: translateY(0) scale(1);
+  }
+}

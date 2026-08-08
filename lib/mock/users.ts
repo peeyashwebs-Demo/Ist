@@ -135,6 +135,19 @@ function makeKycFile(seed: number, status: KycStatus): UserKycFile {
 
 const USER_COUNT = 34;
 
+// User.holdings/.transactions/.kyc are embedded here for mock convenience,
+// but none of them come from a single call on the real API:
+//  - holdings: GET /holdings is investor-only (@Roles('investor'), scoped to
+//    the caller's own JWT, no :userId param) — there is no way for staff to
+//    fetch another investor's holdings today. This dashboard's working
+//    assumption is a new admin-scoped GET /users/:id/holdings route landing
+//    separately; confirm the final path once that PR merges.
+//  - transactions: GET /transactions has no userId filter yet — becomes
+//    GET /transactions?userId=:id once that PR lands (see the SEAM on
+//    getClientRecentTransactions in lib/mock/transactions.ts).
+//  - kyc: GET /kyc-submissions has no userId filter yet either, and User
+//    carries no kycSubmissionId to look one up by — becomes
+//    GET /kyc-submissions?userId=:id once that PR lands.
 export const USERS: User[] = Array.from({ length: USER_COUNT }).map((_, i) => {
   const first = FIRST_NAMES[i % FIRST_NAMES.length];
   const last = LAST_NAMES[(i * 7) % LAST_NAMES.length];
@@ -158,12 +171,24 @@ export const USERS: User[] = Array.from({ length: USER_COUNT }).map((_, i) => {
   };
 });
 
-// SEAM: replace with GET /api/admin/users
+// SEAM: replace with GET /users (query: page, pageSize, kycStatus,
+// accountStatus)
 export function getUsers() {
   return USERS;
 }
 
-// SEAM: replace with GET /api/admin/users/:id
+// SEAM: replace with GET /users/:id — but note this is not a composed
+// "user detail" call on the real API. It returns the bare User profile
+// only; holdings, transaction history and the KYC submission each live on
+// their own resource, and today none of them are reachable for staff at
+// all: GET /holdings is hard-scoped @Roles('investor') with no :userId
+// param (no admin holdings route exists — see the new admin-scoped
+// GET /users/:id/holdings assumption noted where User.holdings is built,
+// below), GET /transactions has no userId filter, and GET /kyc-submissions
+// has no userId filter either (User carries no kycSubmissionId to look one
+// up by). The userId-filter and admin-holdings PRs landing separately close
+// two of these three gaps — until then, a real user-detail screen needs
+// multiple calls and two of them aren't possible yet.
 export function getUserById(id: string) {
   return USERS.find((u) => u.id === id);
 }
@@ -182,10 +207,15 @@ const AUTO_DECISION_COPY: Record<KycStatus, { label: string; summary: string }> 
   review: { label: "Needs review", summary: "Automated checks could not reach a confident decision, so this case is queued for a KYC reviewer." },
   pending: { label: "Pending checks", summary: "Documents have been received but automated verification hasn't completed yet." },
   rejected: { label: "Auto-rejected", summary: "Automated checks found a document or identity mismatch and declined the submission." },
+  flagged: { label: "Flagged", summary: "Automated checks raised a flag on this account that hasn't been cleared by staff yet." },
   expired: { label: "Expired", summary: "This client's verification documents have expired and need to be resubmitted." },
 };
 
-// SEAM: replace with GET /api/admin/users/:id/kyc-decision
+// SEAM: no such endpoint on the real API — this whole "auto decision"
+// concept has no dedicated route. The closest real path is fetching the
+// user's KYC submission (GET /kyc-submissions?userId=:id once that filter
+// PR lands, since User carries no kycSubmissionId today) and deriving this
+// from its vendorDecision/vendorDetail/confidence fields client-side.
 export function getKycAutoDecision(user: User): KycAutoDecision {
   const seed = Number(user.id.replace(/\D/g, "")) || 1;
   const copy = AUTO_DECISION_COPY[user.kycStatus];
@@ -221,7 +251,13 @@ function parseCurrency(v: string) {
   return Number(v.replace(/[^\d.-]/g, "")) || 0;
 }
 
-// SEAM: replace with GET /api/admin/users/:id/summary
+// SEAM: no such endpoint on the real API — cashBalance/lifetimeDeposits/
+// ordersLast30 are dashboard-only synthesis with no backing aggregate
+// documented anywhere. ordersLast30 could eventually be derived client-side
+// from GET /transactions?userId=:id (once that filter PR lands), but
+// cashBalance/lifetimeDeposits have no documented source at all (there is
+// no "wallet balance" concept in this API reference) — flag this as a
+// product gap rather than assume a route for it.
 export function getUserSummary(user: User): UserSummary {
   const seed = Number(user.id.replace(/\D/g, "")) || 1;
   const portfolio = parseCurrency(user.portfolioValue);

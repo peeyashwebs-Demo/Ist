@@ -94,18 +94,22 @@ export function ConfirmationModal({
             borderTop: "1px solid var(--hairline)",
           }}
         >
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            {cancelLabel}
-          </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            disabled={confirmDisabled}
-            onClick={onConfirm}
-            style={tone === "loss" ? { background: confirmDisabled ? "var(--ink-3)" : "var(--loss)" } : undefined}
-          >
-            {confirmLabel}
-          </Button>
+          {cancelLabel ? (
+            <Button variant="ghost" size="sm" onClick={onClose}>
+              {cancelLabel}
+            </Button>
+          ) : null}
+          {confirmLabel ? (
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={confirmDisabled}
+              onClick={onConfirm}
+              style={tone === "loss" ? { background: confirmDisabled ? "var(--ink-3)" : "var(--loss)" } : undefined}
+            >
+              {confirmLabel}
+            </Button>
+          ) : null}
         </div>
       </div>
     </div>

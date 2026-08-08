@@ -1,4 +1,4 @@
-export type Status = "pending" | "review" | "approved" | "rejected" | "expired" | "flagged";
+export type Status = "pending" | "review" | "approved" | "rejected" | "expired" | "flagged" | "completed";
 
 // Workflow state inherits the movement logic: resolved-good reads gain, resolved-bad
 // reads loss, waiting stays neutral ink, and the one state that needs a human
@@ -10,6 +10,7 @@ const STATUS: Record<Status, { label: string; color: string; tint: string }> = {
   rejected: { label: "Rejected", color: "var(--status-rejected)", tint: "var(--status-rejected-tint)" },
   expired: { label: "Expired", color: "var(--status-expired)", tint: "var(--status-expired-tint)" },
   flagged: { label: "Flagged", color: "var(--status-flagged)", tint: "var(--status-flagged-tint)" },
+  completed: { label: "Completed", color: "var(--status-approved)", tint: "var(--status-approved-tint)" },
 };
 
 interface StatusPillProps {

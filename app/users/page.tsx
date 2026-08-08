@@ -8,15 +8,36 @@ import { StatusPill, DotStatus } from "@/components/ui/StatusPill";
 import { SearchPill } from "@/components/ui/SearchPill";
 import { Select } from "@/components/ui/Select";
 import { Button } from "@/components/ui/Button";
-import { getUsers } from "@/lib/mock/users";
-import type { AccountStatus, KycStatus, User } from "@/types/api";
+import { listUsers, ApiError } from "@/lib/api/client";
+import type { ApiUser } from "@/lib/api/types";
+import type { AccountStatus, KycStatus } from "@/types/api";
+import { koboToNaira } from "@/lib/money";
 
 const PER_PAGE = 10;
+
+/** Small inline spinner — used for the loading captions this screen and the
+ * user-detail screen share (frames 3b / 4b), no shared Spinner component exists yet. */
+function Spinner({ size = 15 }: { size?: number }) {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        border: "2px solid var(--hairline)",
+        borderTopColor: "var(--ink-3)",
+        animation: "k-spin 0.7s linear infinite",
+      }}
+    />
+  );
+}
 
 const KYC_OPTIONS = [
   { value: "all", label: "All KYC states" },
   { value: "pending", label: "Pending" },
   { value: "review", label: "Under review" },
+  { value: "flagged", label: "Flagged" },
   { value: "approved", label: "Approved" },
   { value: "rejected", label: "Rejected" },
   { value: "expired", label: "Expired" },
@@ -34,14 +55,10 @@ function accountLabel(status: AccountStatus) {
   return status === "active" ? "Active" : "Suspended";
 }
 
-function parseCurrency(v: string) {
-  return Number(v.replace(/[^\d.-]/g, "")) || 0;
-}
-
-function toCsv(rows: User[]) {
+function toCsv(rows: ApiUser[]) {
   const header = ["Name", "Email", "Phone", "City", "KYC", "Joined", "Account", "Portfolio value"];
   const lines = rows.map((u) =>
-    [u.name, u.email, u.phone, u.city, u.kycStatus, u.joinedAt, accountLabel(u.accountStatus), u.portfolioValue]
+    [u.fullName, u.email, u.phone, u.city, u.kycStatus, u.memberSince, accountLabel(u.accountStatus), koboToNaira(u.portfolioValue)]
       .map((v) => `"${String(v).replace(/"/g, '""')}"`)
       .join(","),
   );
@@ -52,7 +69,10 @@ export default function UsersPage() {
   const router = useRouter();
 
   const [loading, setLoading] = useState(true);
-  const [users, setUsers] = useState<User[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [users, setUsers] = useState<ApiUser[]>([]);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
 
   const [query, setQuery] = useState("");
   const [kycFilter, setKycFilter] = useState<KycStatus | "all">("all");
@@ -61,40 +81,59 @@ export default function UsersPage() {
   const [sortKey, setSortKey] = useState<SortKey>("joinedAt");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
+  // Filters and pagination hit the API directly — there's no client-side
+  // filtering layer anymore, per the wiring guide.
   useEffect(() => {
-    const timer = setTimeout(() => {
-      // SEAM: replace with GET /api/admin/users
-      setUsers(getUsers());
-      setLoading(false);
-    }, 500);
-    return () => clearTimeout(timer);
-  }, []);
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    listUsers({
+      page,
+      pageSize: PER_PAGE,
+      kycStatus: kycFilter === "all" ? undefined : kycFilter,
+      accountStatus: accountFilter === "all" ? undefined : accountFilter,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setUsers(res.data);
+        setTotal(res.meta.total);
+        setTotalPages(res.meta.totalPages);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? err.message : "Couldn't load clients.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page, kycFilter, accountFilter]);
 
   const hasActiveFilters = query.trim() !== "" || kycFilter !== "all" || accountFilter !== "all";
 
-  const filtered = useMemo(() => {
+  // Search and sort apply to the current page only — the API has no
+  // free-text search or sort param, so this is a best-effort refinement of
+  // whatever page the server already filtered for us.
+  const pageRows = useMemo(() => {
     const q = query.trim().toLowerCase();
     let rows = users.filter((u) => {
-      const matchesQuery =
-        !q || u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q) || u.phone.toLowerCase().includes(q);
-      const matchesKyc = kycFilter === "all" || u.kycStatus === kycFilter;
-      const matchesAccount = accountFilter === "all" || u.accountStatus === accountFilter;
-      return matchesQuery && matchesKyc && matchesAccount;
+      if (!q) return true;
+      return (
+        u.fullName.toLowerCase().includes(q) || u.email.toLowerCase().includes(q) || u.phone.toLowerCase().includes(q)
+      );
     });
 
     rows = [...rows].sort((a, b) => {
       let cmp = 0;
-      if (sortKey === "joinedAt") cmp = a.joinedAt.localeCompare(b.joinedAt);
-      if (sortKey === "portfolioValue") cmp = parseCurrency(a.portfolioValue) - parseCurrency(b.portfolioValue);
+      if (sortKey === "joinedAt") cmp = a.memberSince.localeCompare(b.memberSince);
+      if (sortKey === "portfolioValue") cmp = a.portfolioValue - b.portfolioValue;
       return sortDir === "asc" ? cmp : -cmp;
     });
 
     return rows;
-  }, [users, query, kycFilter, accountFilter, sortKey, sortDir]);
-
-  const pageCount = Math.max(1, Math.ceil(filtered.length / PER_PAGE));
-  const currentPage = Math.min(page, pageCount);
-  const pageRows = filtered.slice((currentPage - 1) * PER_PAGE, currentPage * PER_PAGE);
+  }, [users, query, sortKey, sortDir]);
 
   function handleSort(key: string) {
     if (key !== "joinedAt" && key !== "portfolioValue") return;
@@ -104,7 +143,6 @@ export default function UsersPage() {
       setSortKey(key);
       setSortDir("asc");
     }
-    setPage(1);
   }
 
   function clearFilters() {
@@ -115,7 +153,7 @@ export default function UsersPage() {
   }
 
   function exportCsv() {
-    const csv = toCsv(filtered);
+    const csv = toCsv(pageRows);
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -125,11 +163,11 @@ export default function UsersPage() {
     URL.revokeObjectURL(url);
   }
 
-  const columns: DataTableColumn<User>[] = [
+  const columns: DataTableColumn<ApiUser>[] = [
     {
-      key: "name",
+      key: "fullName",
       label: "Client",
-      render: (row) => <TwoLineCell primary={row.name} secondary={row.email} />,
+      render: (row) => <TwoLineCell primary={row.fullName} secondary={row.email} />,
     },
     { key: "phone", label: "Phone", numeric: true },
     {
@@ -137,7 +175,7 @@ export default function UsersPage() {
       label: "KYC",
       render: (row) => <StatusPill status={row.kycStatus} size="sm" />,
     },
-    { key: "joinedAt", label: "Joined", sortable: true, numeric: true },
+    { key: "joinedAt", label: "Joined", sortable: true, numeric: true, render: (row) => row.memberSince.slice(0, 10) },
     {
       key: "accountStatus",
       label: "Account",
@@ -151,6 +189,7 @@ export default function UsersPage() {
       sortable: true,
       numeric: true,
       align: "right",
+      render: (row) => koboToNaira(row.portfolioValue),
     },
   ];
 
@@ -164,24 +203,35 @@ export default function UsersPage() {
         style={{
           display: "inline-block",
           height: 12,
-          width: col.key === "name" ? "70%" : col.align === "right" ? "60%" : "50%",
+          width: col.key === "fullName" ? "70%" : col.align === "right" ? "60%" : "50%",
           borderRadius: 4,
           background: "var(--track)",
         }}
       />
     ),
   }));
-  const skeletonRows = Array.from({ length: 6 }).map((_, i) => ({ id: `skeleton-${i}` }));
+  const skeletonRows = Array.from({ length: 10 }).map((_, i) => ({ id: `skeleton-${i}` }));
 
-  const activeFilterLabels = [
-    kycFilter !== "all" ? KYC_OPTIONS.find((o) => o.value === kycFilter)?.label : null,
-    accountFilter !== "all" ? ACCOUNT_OPTIONS.find((o) => o.value === accountFilter)?.label : null,
-    query.trim() ? `"${query.trim()}"` : null,
-  ].filter(Boolean);
+  const activeKycLabel = kycFilter !== "all" ? KYC_OPTIONS.find((o) => o.value === kycFilter)?.label.toLowerCase() : null;
+  const activeAccountLabel =
+    accountFilter !== "all" ? ACCOUNT_OPTIONS.find((o) => o.value === accountFilter)?.label.toLowerCase() : null;
+  const activeQuery = query.trim();
+
+  // "No {kyc filter}, {account filter} client matches "{search}". Widen the
+  // KYC state or clear the search." — omits a clause for any filter left at
+  // "All" (see frame 3c).
+  function noMatchesText() {
+    const adjectives = [activeKycLabel, activeAccountLabel].filter((v): v is string => Boolean(v));
+    const prefix = adjectives.length ? `${adjectives.join(", ")} ` : "";
+    const subject = activeQuery
+      ? `${prefix}client matches "${activeQuery}"`
+      : `${prefix}clients match these filters`;
+    return `No ${subject}. Widen the KYC state or clear the search.`;
+  }
 
   const toolbar = (
     <>
-      <SearchPill value={query} onChange={(v) => { setQuery(v); setPage(1); }} placeholder="Search name, email or phone" />
+      <SearchPill value={query} onChange={setQuery} placeholder="Search name, email or phone" />
       <Select
         aria-label="Filter by KYC status"
         value={kycFilter}
@@ -203,6 +253,7 @@ export default function UsersPage() {
 
   return (
     <>
+      <style>{"@keyframes k-spin { to { transform: rotate(360deg); } }"}</style>
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         <span className="k-eyebrow">Client records</span>
         <h1 style={{ font: "var(--text-title)", letterSpacing: "var(--track-title)", color: "var(--ink)", margin: 0 }}>
@@ -213,8 +264,28 @@ export default function UsersPage() {
         </p>
       </div>
 
-      {loading ? (
-        <DataTable columns={skeletonColumns} rows={skeletonRows} rowKey={(row) => row.id} toolbar={toolbar} />
+      {error ? (
+        <div style={{ padding: "56px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center", background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-card)" }}>
+          <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
+            Couldn&apos;t load clients
+          </span>
+          <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 340 }}>{error}</span>
+        </div>
+      ) : loading ? (
+        <DataTable
+          columns={skeletonColumns}
+          rows={skeletonRows}
+          rowKey={(row) => row.id}
+          toolbar={toolbar}
+          footer={
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 16px" }}>
+              <Spinner />
+              <span style={{ font: "var(--text-micro)", letterSpacing: "var(--track-micro)", textTransform: "uppercase", color: "var(--ink-3)" }}>
+                Loading clients
+              </span>
+            </div>
+          }
+        />
       ) : (
         <DataTable
           columns={columns}
@@ -226,24 +297,19 @@ export default function UsersPage() {
           onRowClick={(row) => router.push(`/users/${row.id}`)}
           toolbar={toolbar}
           footer={
-            filtered.length > 0 ? (
-              <Pagination page={currentPage} pageCount={pageCount} total={filtered.length} perPage={PER_PAGE} onChange={setPage} />
+            total > 0 ? (
+              <Pagination page={page} pageCount={totalPages} total={total} perPage={PER_PAGE} onChange={setPage} />
             ) : undefined
           }
           empty={
             <>
               <span style={{ font: "var(--text-card-title)", color: "var(--ink)" }}>No clients match these filters</span>
               <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 420 }}>
-                {hasActiveFilters
-                  ? `No results for ${activeFilterLabels.join(", ")}. Try widening or clearing your filters.`
-                  : "Try widening or clearing your filters."}
+                {hasActiveFilters ? noMatchesText() : "Try widening or clearing your filters."}
               </span>
               <span style={{ display: "flex", gap: 8, marginTop: 4 }}>
                 <Button variant="secondary" size="sm" onClick={clearFilters}>
                   Clear filters
-                </Button>
-                <Button variant="ghost" size="sm" onClick={clearFilters}>
-                  Search all {users.length}
                 </Button>
               </span>
             </>

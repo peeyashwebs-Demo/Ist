@@ -11,12 +11,13 @@ import { Icon } from "@/components/icons/Icon";
 import {
   TODAY_LABEL,
   getDeskHeadline,
-  getDeskSummary,
   getFlaggedTransactionsPanel,
   getPendingKycPanel,
-  getTodayVolume,
 } from "@/lib/mock/overview";
-import type { DeskSummary, FlaggedTransaction, KycSubmission, OverviewPanel, TodayVolume } from "@/types/api";
+import type { FlaggedTransaction, KycSubmission, OverviewPanel } from "@/types/api";
+import { getDeskOverview, ApiError } from "@/lib/api/client";
+import type { ApiDeskOverview } from "@/lib/api/types";
+import { koboToNaira, signedKoboToNaira } from "@/lib/money";
 
 function SkeletonBar({ width, height = 12 }: { width: number | string; height?: number }) {
   return <span style={{ display: "inline-block", width, height, borderRadius: 4, background: "var(--track)" }} />;
@@ -51,34 +52,48 @@ function SeeAllLink({ href, count }: { href: string; count: number }) {
   );
 }
 
-function PanelEmptyState({ message }: { message: string }) {
+function PanelEmptyState({ title, message }: { title: string; message: string }) {
   return (
-    <div style={{ padding: "40px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center" }}>
-      <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>{message}</span>
+    <div style={{ padding: "56px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center" }}>
+      <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>{title}</span>
+      <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 300 }}>{message}</span>
     </div>
   );
 }
 
 export default function OverviewPage() {
   const [loading, setLoading] = useState(true);
-  const [summary, setSummary] = useState<DeskSummary | null>(null);
-  const [volume, setVolume] = useState<TodayVolume | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [overview, setOverview] = useState<ApiDeskOverview | null>(null);
+  // Needs-attention / flagged-transactions panels stay on mock data for now —
+  // GET /desk-overview doesn't nest them, and the wiring guide leaves calling
+  // listKycSubmissions({status:'review'}) / listTransactions({status:'flagged'})
+  // directly here as a follow-up, independent of the KPI section above.
   const [kycPanel, setKycPanel] = useState<OverviewPanel<KycSubmission> | null>(null);
   const [flaggedPanel, setFlaggedPanel] = useState<OverviewPanel<FlaggedTransaction> | null>(null);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      // SEAM: replace with GET /api/admin/overview/summary
-      setSummary(getDeskSummary());
-      // SEAM: replace with GET /api/admin/overview/volume-today
-      setVolume(getTodayVolume());
-      // SEAM: replace with GET /api/admin/kyc?status=pending,review&sort=-waitingFor&limit=5
-      setKycPanel(getPendingKycPanel(5));
-      // SEAM: replace with GET /api/admin/transactions/flagged?limit=5
-      setFlaggedPanel(getFlaggedTransactionsPanel(5));
-      setLoading(false);
-    }, 450);
-    return () => clearTimeout(timer);
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    getDeskOverview()
+      .then((data) => {
+        if (cancelled) return;
+        setOverview(data);
+        // Mock panels still load locally until they're wired to the real endpoints.
+        setKycPanel(getPendingKycPanel(5));
+        setFlaggedPanel(getFlaggedTransactionsPanel(5));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? err.message : "Couldn't load the desk overview.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const headline = useMemo(
@@ -92,13 +107,29 @@ export default function OverviewPage() {
       label: "Client",
       render: (row) => <TwoLineCell primary={row.name} secondary={row.email} />,
     },
-    { key: "id", label: "Case ref", numeric: true },
-    { key: "submittedAt", label: "Submitted", numeric: true },
-    { key: "flagReason", label: "Flag reason" },
+    { key: "id", label: "Case", numeric: true },
+    { key: "documentType", label: "Document" },
+    {
+      key: "status",
+      label: "Status",
+      render: (row) => <StatusPill status={row.status} />,
+    },
+    { key: "portfolioValue", label: "Portfolio", align: "right", numeric: true },
     { key: "waitingFor", label: "Waiting", align: "right", numeric: true },
   ];
 
-  if (loading || !summary || !volume || !kycPanel || !flaggedPanel) {
+  if (error) {
+    return (
+      <div style={{ padding: "56px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center" }}>
+        <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
+          Couldn&apos;t load the desk overview
+        </span>
+        <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 340 }}>{error}</span>
+      </div>
+    );
+  }
+
+  if (loading || !overview || !kycPanel || !flaggedPanel) {
     return (
       <>
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -128,35 +159,43 @@ export default function OverviewPage() {
       <PageHead eyebrow={TODAY_LABEL} title="Desk overview" description={headline} />
 
       <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 16 }}>
-        <BalancePanel label="Transaction volume today" value={volume.amount} change={volume.change} series={volume.series} />
+        <BalancePanel
+          label="Assets under management"
+          value={koboToNaira(overview.aumTotalKobo)}
+          change={{
+            label: `${signedKoboToNaira(overview.aumChangeAbsKobo)} (${overview.aumChangePct >= 0 ? "+" : ""}${overview.aumChangePct}%)`,
+            tone: overview.aumChangeAbsKobo >= 0 ? "gain" : "loss",
+          }}
+          series={overview.aumSeries}
+        />
         <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 16 }}>
           <KpiCard
             icon="users"
             label="Total users"
-            value={String(summary.totalUsers)}
-            sub={summary.totalUsersTrend.label}
-            subTone={summary.totalUsersTrend.tone}
+            value={String(overview.totalUsers)}
+            sub={overview.totalUsersTrend.label}
+            subTone={overview.totalUsersTrend.tone}
           />
           <KpiCard
             icon="shield"
             label="KYC approval rate"
-            value={summary.kycApprovalRate}
-            sub={summary.kycApprovalTrend.label}
-            subTone={summary.kycApprovalTrend.tone}
+            value={overview.kycApprovalRate}
+            sub={overview.kycApprovalTrend.label}
+            subTone={overview.kycApprovalTrend.tone}
           />
           <KpiCard
             icon="clock"
             label="Pending KYC"
-            value={String(summary.pendingKyc)}
-            sub={summary.pendingKycTrend.label}
-            subTone={summary.pendingKycTrend.tone}
+            value={String(overview.pendingKyc)}
+            sub={overview.pendingKycTrend.label}
+            subTone={overview.pendingKycTrend.tone}
           />
           <KpiCard
             icon="transfer"
             label="Active orders"
-            value={String(summary.activeOrders)}
-            sub={summary.activeOrdersTrend.label}
-            subTone={summary.activeOrdersTrend.tone}
+            value={String(overview.activeOrders)}
+            sub={overview.activeOrdersTrend.label}
+            subTone={overview.activeOrdersTrend.tone}
           />
         </div>
       </div>
@@ -164,29 +203,34 @@ export default function OverviewPage() {
       <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, alignItems: "start" }}>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
-              Needs attention · pending KYC
-            </span>
+            <span className="k-eyebrow">Needs attention · pending KYC</span>
             <SeeAllLink href="/kyc" count={kycPanel.total} />
           </div>
           <DataTable
             columns={kycColumns}
             rows={kycPanel.items}
             rowKey={(row) => row.id}
-            empty="New submissions land here as clients finish onboarding."
+            empty={
+              <>
+                <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
+                  Nothing waiting on you
+                </span>
+                <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 320 }}>
+                  New submissions land here as clients finish onboarding.
+                </span>
+              </>
+            }
           />
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
-              Flagged transactions
-            </span>
+            <span className="k-eyebrow">Flagged transactions</span>
             <SeeAllLink href="/transactions" count={flaggedPanel.total} />
           </div>
           <div style={{ background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-card)", overflow: "hidden" }}>
             {flaggedPanel.items.length === 0 ? (
-              <PanelEmptyState message="Flagged transactions land here when the risk engine holds an order for review." />
+              <PanelEmptyState title="No flags" message="Trades and withdrawals that breach a rule land here for review." />
             ) : (
               <div style={{ display: "flex", flexDirection: "column" }}>
                 {flaggedPanel.items.map((tx, i) => (

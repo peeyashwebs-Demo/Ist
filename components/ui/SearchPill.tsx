@@ -1,48 +1,46 @@
-import { InputHTMLAttributes } from "react";
+"use client";
+
 import { Icon } from "@/components/icons/Icon";
 
-interface SearchPillProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "onChange" | "size"> {
+interface SearchPillProps {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
-  size?: "sm" | "md";
+  width?: number | string;
 }
 
-const HEIGHT: Record<NonNullable<SearchPillProps["size"]>, number> = { md: 36, sm: 32 };
-
-/** Search input in a hairline pill — the shared filter-bar search control. */
-export function SearchPill({ value, onChange, placeholder = "Search", size = "md", style, ...rest }: SearchPillProps) {
+/** Recessed search field — pill radius, search glyph, ink text. Used for
+ * searching users / transactions from a table toolbar. */
+export function SearchPill({ value, onChange, placeholder = "Search", width = 220 }: SearchPillProps) {
   return (
-    <span
+    <label
       style={{
-        display: "inline-flex",
+        display: "flex",
         alignItems: "center",
         gap: 8,
-        height: HEIGHT[size],
-        minWidth: 240,
+        height: 36,
+        padding: "0 14px",
+        width,
         background: "var(--bg)",
         border: "1px solid var(--hairline)",
         borderRadius: "var(--r-pill)",
-        padding: "0 14px",
-        ...style,
+        transition: "border-color var(--dur-fast) var(--ease-soft), background var(--dur-fast) var(--ease-soft)",
       }}
     >
-      <Icon name="search" size={16} color="var(--ink-3)" />
+      <Icon name="search" size={15} color="var(--ink-3)" />
       <input
-        {...rest}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         style={{
-          flex: 1,
-          minWidth: 0,
           border: "none",
-          background: "transparent",
           outline: "none",
-          font: "var(--text-body)",
+          background: "transparent",
+          width: "100%",
+          font: "var(--text-data)",
           color: "var(--ink)",
         }}
       />
-    </span>
+    </label>
   );
 }

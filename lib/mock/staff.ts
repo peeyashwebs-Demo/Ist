@@ -1,60 +1,80 @@
-import type { StaffMember, StaffRole, StaffStatus } from "@/types/api";
+import type { StaffMember, StaffRole } from "@/types/api";
 
-const NAMES: Array<{ name: string; email: string }> = [
-  { name: "Fola Adeyemi", email: "fola.adeyemi@kudimata.ng" },
-  { name: "Tomi Balogun", email: "tomi.balogun@kudimata.ng" },
-  { name: "Chidi Nwankwo", email: "chidi.nwankwo@kudimata.ng" },
-  { name: "Amaka Eze", email: "amaka.eze@kudimata.ng" },
-  { name: "Segun Okoye", email: "segun.okoye@kudimata.ng" },
-  { name: "Halima Sule", email: "halima.sule@kudimata.ng" },
-  { name: "Bayo Adekunle", email: "bayo.adekunle@kudimata.ng" },
-  { name: "Ifeoma Uche", email: "ifeoma.uche@kudimata.ng" },
-  { name: "Kunle Bakare", email: "kunle.bakare@kudimata.ng" },
-  { name: "Grace Effiong", email: "grace.effiong@kudimata.ng" },
-  { name: "Obinna Chukwu", email: "obinna.chukwu@kudimata.ng" },
-  { name: "Zainab Aliyu", email: "zainab.aliyu@kudimata.ng" },
-  { name: "Dele Fashola", email: "dele.fashola@kudimata.ng" },
-  { name: "Ronke Ajayi", email: "ronke.ajayi@kudimata.ng" },
-  { name: "Emeka Obi", email: "emeka.obi@kudimata.ng" },
-  { name: "Aisha Bello", email: "aisha.bello@kudimata.ng" },
-  { name: "Wale Ogundipe", email: "wale.ogundipe@kudimata.ng" },
-  { name: "Nkechi Anya", email: "nkechi.anya@kudimata.ng" },
+// Seven accounts on the desk, distributed 1 Super admin / 1 Compliance officer /
+// 2 KYC reviewers / 3 Support — exact counts and sample identities from the
+// approved design (frame 8a's staffRows / roleCards data model).
+export const STAFF_MEMBERS: StaffMember[] = [
+  {
+    id: "STF-100",
+    name: "Ifedayo Martins",
+    email: "ifedayo.martins@kudimata.ng",
+    role: "Super admin",
+    status: "approved",
+    statusLabel: "Active",
+    lastSignIn: "14 Mar 2026 · 09:44",
+    addedAt: "2 Jan 2024",
+  },
+  {
+    id: "STF-101",
+    name: "Fola Adeyemi",
+    email: "fola.adeyemi@kudimata.ng",
+    role: "Compliance officer",
+    status: "approved",
+    statusLabel: "Active",
+    lastSignIn: "14 Mar 2026 · 08:41",
+    addedAt: "18 Feb 2024",
+  },
+  {
+    id: "STF-102",
+    name: "Grace Aigbe",
+    email: "grace.aigbe@kudimata.ng",
+    role: "KYC reviewer",
+    status: "approved",
+    statusLabel: "Active",
+    lastSignIn: "14 Mar 2026 · 08:59",
+    addedAt: "4 Sep 2024",
+  },
+  {
+    id: "STF-103",
+    name: "Chidi Nwankwo",
+    email: "chidi.nwankwo@kudimata.ng",
+    role: "KYC reviewer",
+    status: "approved",
+    statusLabel: "Active",
+    lastSignIn: "13 Mar 2026 · 18:02",
+    addedAt: "11 Nov 2024",
+  },
+  {
+    id: "STF-104",
+    name: "Aisha Lawal",
+    email: "aisha.lawal@kudimata.ng",
+    role: "Support",
+    status: "approved",
+    statusLabel: "Active",
+    lastSignIn: "14 Mar 2026 · 07:55",
+    addedAt: "20 Jan 2025",
+  },
+  {
+    id: "STF-105",
+    name: "Musa Ibrahim",
+    email: "musa.ibrahim@kudimata.ng",
+    role: "Support",
+    status: "pending",
+    statusLabel: "Invited",
+    lastSignIn: "Never",
+    addedAt: "13 Mar 2026",
+  },
+  {
+    id: "STF-106",
+    name: "Peter Oyelaran",
+    email: "peter.oyelaran@kudimata.ng",
+    role: "Support",
+    status: "expired",
+    statusLabel: "Deactivated",
+    lastSignIn: "9 Mar 2026 · 16:20",
+    addedAt: "3 Mar 2025",
+  },
 ];
-
-const ROLES: StaffRole[] = ["Super admin", "Compliance officer", "KYC reviewer", "KYC reviewer", "Support"];
-
-function statusAt(i: number): { status: StaffStatus; statusLabel: string } {
-  if (i % 9 === 0) return { status: "pending", statusLabel: "Invited" };
-  if (i % 13 === 0) return { status: "expired", statusLabel: "Deactivated" };
-  return { status: "approved", statusLabel: "Active" };
-}
-
-function dateAt(dayOffset: number) {
-  const base = new Date(Date.UTC(2026, 2, 14));
-  base.setUTCDate(base.getUTCDate() - dayOffset);
-  return base.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
-}
-
-function timeAgoLabel(i: number, status: StaffStatus) {
-  if (status === "pending") return "—";
-  if (status === "expired") return dateAt(90 + i * 4);
-  const hours = (i * 7) % 48;
-  return hours === 0 ? "Just now" : hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
-}
-
-export const STAFF_MEMBERS: StaffMember[] = NAMES.map((person, i) => {
-  const { status, statusLabel } = statusAt(i);
-  return {
-    id: `STF-${100 + i}`,
-    name: person.name,
-    email: person.email,
-    role: ROLES[i % ROLES.length],
-    status,
-    statusLabel,
-    lastSignIn: timeAgoLabel(i, status),
-    addedAt: dateAt(30 + i * 17),
-  };
-});
 
 // SEAM: replace with the authenticated staff session (whoami / auth context)
 export const CURRENT_STAFF = STAFF_MEMBERS[0];
@@ -63,35 +83,39 @@ export const ROLE_CARDS: Array<{ role: StaffRole; who: string; can: string; cann
   {
     role: "Super admin",
     who: "1 person",
-    can: "Everything below, plus invite/deactivate staff and change roles.",
-    cannot: "Nothing — full desk access.",
+    can: "Everything, including staff and roles",
+    cannot: "Nothing is withheld",
   },
   {
     role: "Compliance officer",
-    who: "3 people",
-    can: "Approve/reject KYC, suspend/enable accounts, release held transactions.",
-    cannot: "Cannot invite staff or change roles.",
+    who: "1 person",
+    can: "Suspend and enable clients · release payouts",
+    cannot: "Cannot manage staff",
   },
   {
     role: "KYC reviewer",
-    who: "6 people",
-    can: "Review and decide KYC cases in the queue.",
-    cannot: "Cannot touch transactions, staff, or account status.",
+    who: "2 people",
+    can: "Override KYC decisions · read the audit log",
+    cannot: "Cannot suspend clients or manage staff",
   },
   {
     role: "Support",
-    who: "8 people",
-    can: "View users, transactions and audit log — read-only.",
-    cannot: "Cannot approve, suspend, or release anything.",
+    who: "3 people",
+    can: "Read clients, transactions and cases",
+    cannot: "Cannot decide, suspend or release anything",
   },
 ];
 
-// SEAM: replace with GET /api/admin/staff
+// SEAM: replace with GET /staff-members (roles: compliance_officer,
+// super_admin — supports page/pageSize/role/status query params)
 export function getStaffMembers() {
   return STAFF_MEMBERS;
 }
 
-// SEAM: replace with GET /api/admin/staff/:id
+// SEAM: no single-staff-fetch endpoint exists on the real API — there is no
+// GET /staff-members/:id route documented. List-and-filter client-side from
+// GET /staff-members (paginated, so a large roster may need more than one
+// page fetched), or flag this as a product gap for the backend to close.
 export function getStaffMemberById(id: string) {
   return STAFF_MEMBERS.find((s) => s.id === id);
 }

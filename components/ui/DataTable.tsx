@@ -23,6 +23,10 @@ interface DataTableProps<T> {
   onSort?: (key: string) => void;
   onRowClick?: (row: T) => void;
   dense?: boolean;
+  /** Fixed-column layout — a CSS grid template. When set, the header and row
+   * cells render as distinct tracks with 16px per-cell padding (cell-pad-x)
+   * instead of flexed columns, so headers never run together. */
+  gridTemplateColumns?: string;
   /** Rendered when `rows` is empty — pass a message string or a full empty-state node. */
   empty?: ReactNode;
   /** Search + filter controls, rendered in a bordered strip above the table. */
@@ -43,11 +47,16 @@ export function DataTable<T>({
   onSort,
   onRowClick,
   dense = false,
+  gridTemplateColumns,
   empty = "Nothing here yet",
   toolbar,
   footer,
 }: DataTableProps<T>) {
   const rowHeight = dense ? "var(--row-h-dense)" : "var(--row-h)";
+  const grid = Boolean(gridTemplateColumns);
+  // Shared cell padding: fixed tracks pad every cell to cell-pad-x so columns
+  // sit 16px apart regardless of content; flexed columns rely on container padding.
+  const cellPad = grid ? { padding: "0 var(--cell-pad-x)", minWidth: 0 } : {};
 
   return (
     <div style={{ background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-table)", overflow: "hidden" }}>
@@ -59,10 +68,11 @@ export function DataTable<T>({
 
       <div
         style={{
-          display: "flex",
+          display: grid ? "grid" : "flex",
+          gridTemplateColumns,
           alignItems: "center",
           height: 40,
-          padding: "0 var(--cell-pad-x)",
+          padding: grid ? 0 : "0 var(--cell-pad-x)",
           borderBottom: "1px solid var(--hairline)",
           font: "var(--text-label)",
           letterSpacing: "var(--track-label)",
@@ -75,14 +85,14 @@ export function DataTable<T>({
             key={col.key}
             onClick={col.sortable ? () => onSort?.(col.key) : undefined}
             style={{
-              flex: col.width ? `0 0 ${col.width}` : 1,
-              width: col.width,
+              ...(grid ? {} : { flex: col.width ? `0 0 ${col.width}` : 1, width: col.width }),
               display: "flex",
               alignItems: "center",
               justifyContent: col.align === "right" ? "flex-end" : "flex-start",
               gap: 4,
               cursor: col.sortable ? "pointer" : "default",
               userSelect: "none",
+              ...cellPad,
             }}
           >
             {col.label}
@@ -111,10 +121,11 @@ export function DataTable<T>({
             key={rowKey(row)}
             onClick={onRowClick ? () => onRowClick(row) : undefined}
             style={{
-              display: "flex",
+              display: grid ? "grid" : "flex",
+              gridTemplateColumns,
               alignItems: "center",
-              height: rowHeight,
-              padding: "0 var(--cell-pad-x)",
+              minHeight: rowHeight,
+              padding: grid ? "6px 0" : "6px var(--cell-pad-x)",
               borderBottom: "1px solid var(--hairline)",
               cursor: onRowClick ? "pointer" : "default",
             }}
@@ -124,8 +135,7 @@ export function DataTable<T>({
                 key={col.key}
                 className={col.numeric ? "k-tnum" : undefined}
                 style={{
-                  flex: col.width ? `0 0 ${col.width}` : 1,
-                  width: col.width,
+                  ...(grid ? {} : { flex: col.width ? `0 0 ${col.width}` : 1, width: col.width }),
                   minWidth: 0,
                   textAlign: col.align === "right" ? "right" : "left",
                   font: "var(--text-data)",
@@ -135,6 +145,7 @@ export function DataTable<T>({
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: col.render ? "normal" : "nowrap",
+                  ...cellPad,
                 }}
               >
                 {col.render ? col.render(row) : String((row as Record<string, unknown>)[col.key] ?? "")}
