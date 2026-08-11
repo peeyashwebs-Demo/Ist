@@ -7,13 +7,14 @@ interface InputProps extends Omit<InputHTMLAttributes<HTMLInputElement>, "size" 
   hint?: string;
   error?: string;
   prefix?: ReactNode;
+  suffix?: ReactNode;
   /** Field height — 44 in forms, 36 in table toolbars. */
   height?: number;
 }
 
 /** Text input — hairline border, 10px radius, ink data role. Form labels use
  * the label role (uppercase, tracked). */
-export function Input({ label, hint, error, prefix, id, height = 44, style, ...rest }: InputProps) {
+export function Input({ label, hint, error, prefix, suffix, id, height = 44, style, ...rest }: InputProps) {
   return (
     <label style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%", ...style }}>
       {label ? (
@@ -27,7 +28,7 @@ export function Input({ label, hint, error, prefix, id, height = 44, style, ...r
           style={{
             width: "100%",
             height,
-            padding: prefix ? "0 14px 0 38px" : "0 14px",
+            padding: prefix ? "0 14px 0 38px" : suffix ? "0 38px 0 14px" : "0 14px",
             background: "var(--paper)",
             border: `1px solid ${error ? "var(--border-error)" : "var(--hairline)"}`,
             borderRadius: "var(--r-input)",
@@ -39,6 +40,7 @@ export function Input({ label, hint, error, prefix, id, height = 44, style, ...r
           }}
           {...rest}
         />
+        {suffix ? <span style={{ position: "absolute", right: 12, display: "grid", placeItems: "center" }}>{suffix}</span> : null}
       </div>
       {error ? (
         <span className="k-tnum" style={{ font: "var(--text-micro)", color: "var(--loss)" }}>{error}</span>

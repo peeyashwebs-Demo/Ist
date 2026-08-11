@@ -259,6 +259,9 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
     ...rest,
     headers,
     body: requestBody,
+    // Always hit the network — the desk's Refresh buttons must not be served
+    // a cached copy of a page (stale approvals, held counts, queue rows).
+    cache: "no-store",
   });
 
   const text = await res.text();

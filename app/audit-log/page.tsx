@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useEffect } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { DataTable, TwoLineCell, DataTableColumn } from "@/components/ui/DataTable";
 import { Pagination } from "@/components/ui/Pagination";
@@ -10,19 +10,51 @@ import { Select } from "@/components/ui/Select";
 import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/icons/Icon";
 import { SkeletonTable } from "@/components/ui/Skeleton";
-import { getAuditLog } from "@/lib/mock/audit";
-import type { AuditLogEntry, AuditKind } from "@/types/api";
+import {
+  listAuditLog,
+  listUsers,
+  listStaffMembers,
+  getUser,
+  getKycSubmission,
+  getTransaction,
+  ApiError,
+} from "@/lib/api/client";
+import type { ApiAuditKind, ApiAuditLogEntry, ApiStaffRole, ApiUser, ApiStaffMember } from "@/lib/api/types";
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// Caps for the side-channel lookups that resolve audit `target` ids into
+// display names — one bounded fetch each, shared across every row on the page
+// instead of N+1 fetching per entry.
+const LOOKUP_CAP = 500;
 
-function parseWhen(s: string): Date {
-  const [datePart, timePart] = s.split(", ");
-  const [day, month] = datePart.split(" ");
-  const [h, m] = timePart.split(":");
-  return new Date(2026, MONTHS.indexOf(month), Number(day), Number(h), Number(m));
+const KIND_OPTIONS: { value: ApiAuditKind; label: string }[] = [
+  { value: "kyc", label: "KYC decision" },
+  { value: "account", label: "Account change" },
+  { value: "transaction", label: "Transaction" },
+  { value: "staff", label: "Staff change" },
+  { value: "session", label: "Sign-in" },
+];
+
+const ROLE_LABEL: Record<ApiStaffRole, string> = {
+  super_admin: "Super admin",
+  compliance_officer: "Compliance officer",
+  kyc_reviewer: "KYC reviewer",
+  support: "Support",
+};
+
+function roleLabel(r: ApiStaffRole | null) {
+  return r ? ROLE_LABEL[r] ?? r : "System";
 }
 
-const ACTIONS: AuditKind[] = ["KYC", "Account", "Transaction", "Staff", "Session"];
+function fmtWhen(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function shortId(id: string) {
+  return id.slice(0, 8);
+}
+
 const DATE_RANGES = [
   { label: "Last 7 days", days: 7 },
   { label: "Today", days: 1 },
@@ -30,67 +62,172 @@ const DATE_RANGES = [
   { label: "All time", days: Infinity },
 ];
 
-// Exact wording from the design's action-filter options — distinct from the
-// underlying AuditKind values the filter actually matches against.
-export const AUDIT_KIND_LABEL: Record<AuditKind, string> = {
-  KYC: "KYC decision",
-  Account: "Account change",
-  Transaction: "Transaction",
-  Staff: "Staff change",
-  Session: "Sign-in",
-};
-
 export default function AuditLogPage() {
   const router = useRouter();
-  const all = useMemo(() => getAuditLog(), []);
-  const [loading, setLoading] = useState(true);
 
   const [search, setSearch] = useState("");
   const [staffFilter, setStaffFilter] = useState("All staff");
-  const [kindFilter, setKindFilter] = useState<AuditKind | "All actions">("All actions");
+  const [kindFilter, setKindFilter] = useState<ApiAuditKind | "All actions">("All actions");
   const [rangeDays, setRangeDays] = useState<number>(7);
 
   const [page, setPage] = useState(1);
   const [perPage, setPerPage] = useState(10);
 
-  useEffect(() => {
-    const t = setTimeout(() => setLoading(false), 650);
-    return () => clearTimeout(t);
-  }, []);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [rows, setRows] = useState<ApiAuditLogEntry[]>([]);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
 
-  const staffNames = useMemo(() => Array.from(new Set(all.map((e) => e.staffName))), [all]);
+  // Side-channel maps for target resolution — capped fetches shared across
+  // the whole page rather than one request per row.
+  const [usersById, setUsersById] = useState<Map<string, ApiUser>>(new Map());
+  const [staffById, setStaffById] = useState<Map<string, ApiStaffMember>>(new Map());
+  const [targetNames, setTargetNames] = useState<Map<string, string>>(new Map());
+  const targetNameCache = useRef<Map<string, string>>(new Map());
+
+  // Manual refresh — `refresh` bumps a tick the fetch effect depends on, so
+  // the Refresh button re-runs the live fetch even when filters haven't moved.
+  // `refreshing` feeds the button's disabled state.
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const refresh = () => {
+    setRefreshing(true);
+    setRefreshTick((t) => t + 1);
+  };
 
   const resetPage = () => setPage(1);
 
-  function resetFilters() {
-    setSearch("");
-    setStaffFilter("All staff");
-    setKindFilter("All actions");
-    setRangeDays(7);
-    resetPage();
-  }
+  useEffect(() => {
+    let cancelled = false;
+    listAuditLog({
+      page,
+      pageSize: perPage,
+      kind: kindFilter === "All actions" ? undefined : kindFilter,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setRows(res.data);
+        setTotal(res.meta.total);
+        setTotalPages(res.meta.totalPages);
+        setError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? `${err.message} (HTTP ${err.status})` : "Couldn't load the audit log.");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page, perPage, kindFilter, refreshTick]);
+
+  // Users + staff lookups — populate once, tolerate failure (the log still
+  // renders with raw ids as the fallback).
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([listUsers({ page: 1, pageSize: LOOKUP_CAP }), listStaffMembers({ page: 1, pageSize: LOOKUP_CAP })])
+      .then(([users, staff]) => {
+        if (cancelled) return;
+        setUsersById(new Map(users.data.map((u) => [u.id, u])));
+        setStaffById(new Map(staff.data.map((s) => [s.id, s])));
+      })
+      .catch(() => {
+        // resolution is a display nicety — raw ids fall back
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Batch-resolve only the targets visible on the current page. The real API
+  // has no targetName on the wire, so each kind resolves to a display name:
+  // account -> user.fullName, kyc -> submission.name, transaction -> the
+  // owning user's name (via targetDetail "user:<id>"), staff/session -> the
+  // staff member's name.
+  useEffect(() => {
+    let cancelled = false;
+    const missing: { key: string; kind: ApiAuditKind; id: string }[] = [];
+    for (const e of rows) {
+      const key = `${e.kind}:${e.target}`;
+      if (targetNameCache.current.has(key)) continue;
+      missing.push({ key, kind: e.kind, id: e.target });
+    }
+    if (!missing.length) return;
+
+    async function resolveOne(entry: { key: string; kind: ApiAuditKind; id: string }) {
+      try {
+        if (entry.kind === "account") {
+          const u = usersById.get(entry.id) ?? (await getUser(entry.id));
+          return [entry.key, u?.fullName ?? shortId(entry.id)] as const;
+        }
+        if (entry.kind === "kyc") {
+          const s = await getKycSubmission(entry.id);
+          return [entry.key, s?.name ?? shortId(entry.id)] as const;
+        }
+        if (entry.kind === "transaction") {
+          const t = await getTransaction(entry.id);
+          if (t?.userId) {
+            const owner = usersById.get(t.userId);
+            if (owner) return [entry.key, owner.fullName] as const;
+          }
+          return [entry.key, t?.title ?? shortId(entry.id)] as const;
+        }
+        if (entry.kind === "staff" || entry.kind === "session") {
+          const s = staffById.get(entry.id);
+          return [entry.key, s?.name ?? shortId(entry.id)] as const;
+        }
+        return [entry.key, shortId(entry.id)] as const;
+      } catch {
+        return [entry.key, shortId(entry.id)] as const;
+      }
+    }
+
+    Promise.all(missing.map(resolveOne)).then((results) => {
+      if (cancelled) return;
+      const next = new Map(targetNameCache.current);
+      results.forEach(([k, v]) => next.set(k, v));
+      targetNameCache.current = next;
+      setTargetNames(new Map(next));
+    });
+    return () => {
+      cancelled = true;
+    };
+    // usersById/staffById are stable once populated; re-running only adds
+    // newly-visible ids.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows]);
+
+  const targetNameOf = (e: ApiAuditLogEntry) => targetNames.get(`${e.kind}:${e.target}`) ?? shortId(e.target);
+
+  const staffNames = useMemo(() => Array.from(new Set(rows.map((e) => e.staffName))), [rows]);
 
   const filtered = useMemo(() => {
-    const today = new Date(2026, 2, 14);
-    const cutoff = rangeDays === Infinity ? null : new Date(today.getTime() - (rangeDays - 1) * 86400000);
+    const now = new Date();
+    const cutoff = rangeDays === Infinity ? null : new Date(now.getTime() - (rangeDays - 1) * 86400000);
     const q = search.trim().toLowerCase();
-    return all.filter((e) => {
+    return rows.filter((e) => {
       if (staffFilter !== "All staff" && e.staffName !== staffFilter) return false;
-      if (kindFilter !== "All actions" && e.kind !== kindFilter) return false;
-      if (cutoff && parseWhen(e.when) < cutoff) return false;
-      if (q && !`${e.targetName} ${e.target} ${e.targetDetail}`.toLowerCase().includes(q)) return false;
+      if (cutoff && new Date(e.when) < cutoff) return false;
+      if (q && !`${targetNameOf(e)} ${e.target} ${e.targetDetail} ${e.detail} ${e.action}`.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [all, search, staffFilter, kindFilter, rangeDays]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, search, staffFilter, rangeDays, targetNames]);
 
-  const pageCount = Math.max(1, Math.ceil(filtered.length / perPage));
-  const safePage = Math.min(page, pageCount);
-  const rows = filtered.slice((safePage - 1) * perPage, safePage * perPage);
+  const safePage = Math.min(page, totalPages);
+  const displayRows = filtered;
 
   function exportCsv() {
     const header = ["When", "Entry", "Staff", "Role", "Action", "Kind", "Affected", "Affected detail", "Detail"];
     const lines = filtered.map((e) =>
-      [e.when, e.id, e.staffName, e.staffRole, e.action, e.kind, e.targetName, e.targetDetail, e.detail]
+      [e.when, e.id, e.staffName, e.staffRole, e.action, e.kind, targetNameOf(e), e.targetDetail, e.detail]
         .map((v) => `"${String(v).replace(/"/g, '""')}"`)
         .join(","),
     );
@@ -104,13 +241,44 @@ export default function AuditLogPage() {
     URL.revokeObjectURL(url);
   }
 
-  const columns: DataTableColumn<AuditLogEntry>[] = [
-    { key: "when", label: "When", numeric: true, render: (r) => <TwoLineCell primary={r.when} secondary={r.id} /> },
-    { key: "staff", label: "Staff", render: (r) => <TwoLineCell primary={r.staffName} secondary={r.staffRole} /> },
-    { key: "action", label: "Action", render: (r) => <TwoLineCell primary={r.action} secondary={r.kind} /> },
-    { key: "target", label: "Affected", render: (r) => <TwoLineCell primary={r.targetName} secondary={r.targetDetail} /> },
+  const AUDIT_KIND_LABEL: Record<ApiAuditKind, string> = {
+    kyc: "KYC decision",
+    account: "Account change",
+    transaction: "Transaction",
+    staff: "Staff change",
+    session: "Sign-in",
+  };
+
+  const columns: DataTableColumn<ApiAuditLogEntry>[] = [
+    { key: "when", label: "When", numeric: true, render: (r) => <TwoLineCell primary={fmtWhen(r.when)} secondary={shortId(r.id)} /> },
+    { key: "staff", label: "Staff", render: (r) => <TwoLineCell primary={r.staffName} secondary={roleLabel(r.staffRole)} /> },
+    { key: "action", label: "Action", render: (r) => <TwoLineCell primary={r.action} secondary={AUDIT_KIND_LABEL[r.kind]} /> },
+    { key: "target", label: "Affected", render: (r) => <TwoLineCell primary={targetNameOf(r)} secondary={r.targetDetail} /> },
     { key: "detail", label: "Detail", render: (r) => <span style={{ color: "var(--ink-2)" }}>{r.detail}</span> },
   ];
+
+  if (error) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: "var(--gap-section)" }}>
+        <PageHead
+          eyebrow="Compliance record"
+          title="Audit log"
+          description="Every action taken on the desk, newest first. Entries cannot be edited or deleted, only read and exported."
+        />
+        <div style={{ padding: "56px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center", background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-card)" }}>
+          <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
+            Couldn&apos;t load the audit log
+          </span>
+          <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 340 }}>
+            The audit log is read-only — if the service is down the record is still intact, it just can&apos;t be reached right now. {error}
+          </span>
+          <Button variant="secondary" size="sm" iconLeft="refresh" onClick={refresh} disabled={refreshing} style={{ marginTop: 10 }}>
+            Try again
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--gap-section)" }}>
@@ -133,7 +301,7 @@ export default function AuditLogPage() {
       >
         <Icon name="lock" size={16} color="var(--ink-3)" />
         <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>
-          Read-only · {all.length.toLocaleString()} entries retained for seven years · exports are themselves logged
+          Read-only · {total.toLocaleString()} entries retained for seven years · exports are themselves logged
         </span>
       </div>
 
@@ -142,7 +310,7 @@ export default function AuditLogPage() {
       ) : (
         <DataTable
           columns={columns}
-          rows={rows}
+          rows={displayRows}
           rowKey={(r) => r.id}
           dense
           onRowClick={(r) => router.push(`/audit-log/${r.id}`)}
@@ -172,14 +340,14 @@ export default function AuditLogPage() {
                 aria-label="Filter by action"
                 value={kindFilter}
                 onChange={(v) => {
-                  setKindFilter(v as AuditKind | "All actions");
+                  setKindFilter(v as ApiAuditKind | "All actions");
                   resetPage();
                 }}
                 height={36}
                 width={176}
                 options={[
                   { value: "All actions", label: "All actions" },
-                  ...ACTIONS.map((k) => ({ value: k, label: AUDIT_KIND_LABEL[k] })),
+                  ...KIND_OPTIONS.map((k) => ({ value: k.value, label: k.label })),
                 ]}
               />
               <Select
@@ -194,6 +362,9 @@ export default function AuditLogPage() {
                 options={DATE_RANGES.map((r) => ({ value: String(r.days), label: r.label }))}
               />
               <span style={{ flex: 1 }} />
+              <Button variant="ghost" size="sm" iconLeft="refresh" onClick={refresh} disabled={refreshing}>
+                Refresh
+              </Button>
               <Button variant="secondary" size="sm" iconLeft="download" onClick={exportCsv}>
                 Export CSV
               </Button>
@@ -202,8 +373,8 @@ export default function AuditLogPage() {
           footer={
             <Pagination
               page={safePage}
-              pageCount={pageCount}
-              total={filtered.length}
+              pageCount={totalPages}
+              total={total}
               perPage={perPage}
               onChange={setPage}
               onPerPageChange={(n) => {
@@ -221,7 +392,7 @@ export default function AuditLogPage() {
                 Nothing on the desk can be done without leaving an entry.
               </span>
               <div style={{ marginTop: 8 }}>
-                <Button variant="secondary" size="sm" iconLeft="refresh" onClick={resetFilters}>
+                <Button variant="secondary" size="sm" iconLeft="refresh" onClick={refresh} disabled={refreshing}>
                   Refresh
                 </Button>
               </div>

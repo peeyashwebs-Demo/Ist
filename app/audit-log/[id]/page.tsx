@@ -1,26 +1,60 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useParams, useRouter, notFound } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { DataTable, DataTableColumn, TwoLineCell } from "@/components/ui/DataTable";
 import { StatusPill } from "@/components/ui/StatusPill";
 import { Button } from "@/components/ui/Button";
 import { Icon } from "@/components/icons/Icon";
 import { SkeletonCard } from "@/components/ui/Skeleton";
-import { getAuditLog, getAuditLogEntryById } from "@/lib/mock/audit";
-import { getUsers } from "@/lib/mock/users";
-import type { AuditKind, AuditLogEntry } from "@/types/api";
+import {
+  listAuditLog,
+  listStaffMembers,
+  getUser,
+  getKycSubmission,
+  getTransaction,
+  ApiError,
+} from "@/lib/api/client";
+import type { ApiAuditKind, ApiAuditLogEntry, ApiStaffRole, ApiUser } from "@/lib/api/types";
 
-// Same wording as the audit-log list's action filter — used for the
-// "Area" field in the record card.
-const AUDIT_KIND_LABEL: Record<AuditKind, string> = {
-  KYC: "KYC decision",
-  Account: "Account change",
-  Transaction: "Transaction",
-  Staff: "Staff change",
-  Session: "Sign-in",
+const LOOKUP_CAP = 500;
+
+const AUDIT_KIND_LABEL: Record<ApiAuditKind, string> = {
+  kyc: "KYC decision",
+  account: "Account change",
+  transaction: "Transaction",
+  staff: "Staff change",
+  session: "Sign-in",
 };
+
+const ROLE_LABEL: Record<ApiStaffRole, string> = {
+  super_admin: "Super admin",
+  compliance_officer: "Compliance officer",
+  kyc_reviewer: "KYC reviewer",
+  support: "Support",
+};
+
+function roleLabel(r: ApiStaffRole | null) {
+  return r ? ROLE_LABEL[r] ?? r : "System";
+}
+
+function fmtWhen(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+function shortId(id: string) {
+  return id.slice(0, 8);
+}
 
 const labelStyle = {
   font: "var(--text-label)",
@@ -46,54 +80,88 @@ export default function AuditEntryDetailPage() {
   const { id } = useParams<{ id: string }>();
 
   const [loading, setLoading] = useState(true);
-  const [entry, setEntry] = useState<AuditLogEntry | null | undefined>(undefined);
+  const [error, setError] = useState<string | null>(null);
+  const [entry, setEntry] = useState<ApiAuditLogEntry | null>(null);
+  const [related, setRelated] = useState<ApiAuditLogEntry[]>([]);
+
+  // Target + client resolution — no single-entry endpoint exists, so we load
+  // the newest page of the log, find the entry, and resolve its target the
+  // same way the list does.
+  const [client, setClient] = useState<ApiUser | null>(null);
+  const [targetName, setTargetName] = useState<string>(shortId(id));
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      // SEAM: replace with GET /api/admin/audit-log/:id
-      setEntry(getAuditLogEntryById(id) ?? null);
-      setLoading(false);
-    }, 400);
-    return () => clearTimeout(timer);
+    let cancelled = false;
+    listAuditLog({ page: 1, pageSize: 50 })
+      .then(async (res) => {
+        if (cancelled) return;
+        const found = res.data.find((e) => e.id === id) ?? null;
+        setEntry(found);
+        setRelated((found ? res.data : []).filter((e) => e.id !== id && e.target === found?.target));
+
+        if (!found) return;
+
+        // Resolve the affected entity to a display name.
+        if (found.kind === "account") {
+          const u = await getUser(found.target).catch(() => null);
+          if (cancelled) return;
+          setClient(u);
+          setTargetName(u?.fullName ?? shortId(found.target));
+        } else if (found.kind === "kyc") {
+          const s = await getKycSubmission(found.target).catch(() => null);
+          if (cancelled) return;
+          setTargetName(s?.name ?? shortId(found.target));
+        } else if (found.kind === "transaction") {
+          const t = await getTransaction(found.target).catch(() => null);
+          if (cancelled) return;
+          if (t?.userId) {
+            const owner = await getUser(t.userId).catch(() => null);
+            if (cancelled) return;
+            if (owner) setTargetName(owner.fullName);
+            else setTargetName(t.title);
+          } else {
+            setTargetName(t?.title ?? shortId(found.target));
+          }
+        } else if (found.kind === "staff" || found.kind === "session") {
+          const staff = await listStaffMembers({ page: 1, pageSize: LOOKUP_CAP }).catch(() => null);
+          if (cancelled) return;
+          setTargetName(staff?.data.find((s) => s.id === found.target)?.name ?? shortId(found.target));
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? err.message : "Couldn't load this audit entry.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
-  const client = useMemo(() => {
-    if (!entry || entry.kind !== "Account") return undefined;
-    // `target` is already the real user id for Account-kind entries — no
-    // name lookup needed.
-    return getUsers().find((u) => u.id === entry.target);
-  }, [entry]);
-
-  const related = useMemo(() => {
-    if (!entry) return [];
-    return getAuditLog().filter((e) => e.id !== entry.id && e.target === entry.target);
-  }, [entry]);
-
-  if (!loading && entry === null) {
-    notFound();
+  function exportEntry() {
+    if (!entry) return;
+    const blob = new Blob([JSON.stringify(entry, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `audit-entry-${entry.id}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   const backLink = (
     <Link
       href="/audit-log"
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 6,
-        alignSelf: "flex-start",
-        font: "var(--text-label)",
-        letterSpacing: "var(--track-label)",
-        textTransform: "uppercase",
-        color: "var(--ink-3)",
-        width: "fit-content",
-      }}
+      style={{ display: "inline-flex", alignItems: "center", gap: 6, font: "var(--text-label)", letterSpacing: "var(--track-label)", textTransform: "uppercase", color: "var(--ink-3)", width: "fit-content" }}
     >
       <Icon name="chevronLeft" size={13} color="var(--ink-3)" />
-      All entries
+      All audit entries
     </Link>
   );
 
-  if (loading || !entry) {
+  if (loading) {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
         {backLink}
@@ -106,37 +174,34 @@ export default function AuditEntryDetailPage() {
     );
   }
 
-  function exportEntry() {
-    if (!entry) return;
-    const blob = new Blob([JSON.stringify(entry, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${entry.id}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+  if (error || !entry) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+        {backLink}
+        <div className="error-strip">{error ?? "Entry not found — it may have been truncated by the retention window."}</div>
+      </div>
+    );
   }
 
   const record: Array<{ label: string; value: string }> = [
-    { label: "Entry", value: entry.id },
-    { label: "When", value: entry.when },
-    { label: "Staff", value: `${entry.staffName} · ${entry.staffRole}` },
-    { label: "Area", value: entry.area ?? AUDIT_KIND_LABEL[entry.kind] },
+    { label: "Entry", value: shortId(entry.id) },
+    { label: "When", value: fmtWhen(entry.when) },
+    { label: "Staff", value: `${entry.staffName} · ${roleLabel(entry.staffRole)}` },
+    { label: "Area", value: AUDIT_KIND_LABEL[entry.kind] },
+    { label: "Affected", value: targetName },
   ];
-  if (entry.caseId) record.push({ label: "Case", value: `${entry.caseId} · ${entry.targetName}` });
-  if (entry.sessionId) record.push({ label: "Session", value: entry.sessionId });
+  if (entry.targetDetail) record.push({ label: "Ref", value: entry.targetDetail });
 
   const hasVendorOrReason = Boolean(entry.vendorFlag || entry.staffReasonQuote);
   const hasBeforeAfter = Boolean(entry.beforeAfter && entry.beforeAfter.length);
 
-  const relatedColumns: DataTableColumn<AuditLogEntry>[] = [
-    { key: "when", label: "When", numeric: true, render: (r) => <TwoLineCell primary={r.when} secondary={r.id} /> },
-    { key: "action", label: "Action", render: (r) => <TwoLineCell primary={r.action} secondary={r.kind} /> },
+  const relatedColumns: DataTableColumn<ApiAuditLogEntry>[] = [
+    { key: "when", label: "When", numeric: true, render: (r) => <TwoLineCell primary={fmtWhen(r.when)} secondary={shortId(r.id)} /> },
+    { key: "action", label: "Action", render: (r) => <TwoLineCell primary={r.action} secondary={AUDIT_KIND_LABEL[r.kind]} /> },
+    { key: "staff", label: "Staff", render: (r) => <span style={{ color: "var(--ink-2)" }}>{r.staffName}</span> },
   ];
 
-  const metaParts = [entry.id, entry.staffName, entry.when];
-  if (entry.caseId) metaParts.push(`case ${entry.caseId}`);
-  metaParts.push(entry.targetName);
+  const metaParts = [shortId(entry.id), entry.staffName, fmtWhen(entry.when)];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -155,12 +220,12 @@ export default function AuditEntryDetailPage() {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 10, flex: "0 0 auto" }}>
-          {entry.kind === "KYC" && entry.caseId ? (
-            <Button variant="ghost" size="sm" iconLeft="doc" onClick={() => router.push(`/kyc/${entry.caseId}`)}>
+          {entry.kind === "kyc" ? (
+            <Button variant="ghost" size="sm" iconLeft="doc" onClick={() => router.push(`/kyc/${entry.target}`)}>
               Open case
             </Button>
           ) : null}
-          {client ? (
+          {entry.kind === "account" && client ? (
             <Button variant="ghost" size="sm" iconLeft="users" onClick={() => router.push(`/users/${client.id}`)}>
               Open client
             </Button>
@@ -175,10 +240,7 @@ export default function AuditEntryDetailPage() {
         <div style={cardStyle()}>
           <span style={labelStyle}>Record</span>
           {record.map((d) => (
-            <div
-              key={d.label}
-              style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--hairline)" }}
-            >
+            <div key={d.label} style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
               <span style={{ font: "var(--text-micro)", letterSpacing: "var(--track-micro)", textTransform: "uppercase", color: "var(--ink-3)" }}>
                 {d.label}
               </span>
@@ -210,12 +272,12 @@ export default function AuditEntryDetailPage() {
                 </div>
               ) : null}
             </>
-          ) : (
-            <div style={cardStyle()}>
-              <span style={labelStyle}>Detail</span>
-              <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>{entry.detail}</span>
-            </div>
-          )}
+          ) : null}
+
+          <div style={cardStyle()}>
+            <span style={labelStyle}>Detail</span>
+            <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>{entry.detail}</span>
+          </div>
         </div>
 
         {hasBeforeAfter ? (

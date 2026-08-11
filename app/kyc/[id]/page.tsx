@@ -1,11 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import type { KycRejectReason, KycSubmission } from "@/types/api";
-import { decideKycSubmission, getKycSubmissionById, saveKycReviewerChecklist } from "@/lib/mock/kyc";
-import { recordKycOverride } from "@/lib/mock/audit";
-import { useMockLoading } from "@/lib/useMockLoading";
+import type { ApiKycSubmission, ApiKycDocumentType } from "@/lib/api/types";
+import { getKycSubmission, saveKycReviewerChecklist, decideKyc, ApiError } from "@/lib/api/client";
 import { PageHead } from "@/components/ui/PageHead";
 import { Card } from "@/components/ui/Card";
 import { StatusPill } from "@/components/ui/StatusPill";
@@ -14,19 +12,13 @@ import { Modal } from "@/components/ui/Modal";
 import { Input } from "@/components/ui/Input";
 import { Radio } from "@/components/ui/Radio";
 import { Checkbox } from "@/components/ui/Checkbox";
-import { DocumentPreview } from "@/components/ui/DocumentPreview";
 import { Icon } from "@/components/icons/Icon";
 import { SkeletonCard, SkeletonInline } from "@/components/ui/Skeleton";
 
-// Mock "today" — matches the desk-wide anchor date used across the queue,
-// transactions and audit log screens.
-const CASE_LOG_DATE = "14 Mar 2026";
-const STAFF_NAME = "Fola Adeyemi";
-
 // Reason shown to the client maps 1:1 to the real decision endpoint's
 // rejectReason enum — the label is display-only, `value` is what actually
-// goes over the wire (see KycRejectReason in types/api.ts).
-const REJECT_REASONS: Array<{ label: string; description?: string; value: KycRejectReason }> = [
+// goes over the wire (see DecideKycRequest in lib/api/types.ts).
+const REJECT_REASONS: Array<{ label: string; description?: string; value: "unreadable" | "name_mismatch" | "expired" | "liveness_inconclusive" }> = [
   { label: "Liveness capture inconclusive", description: "Ask for a re-capture in daylight", value: "liveness_inconclusive" },
   { label: "Document unreadable", value: "unreadable" },
   { label: "Name does not match BVN", value: "name_mismatch" },
@@ -34,8 +26,8 @@ const REJECT_REASONS: Array<{ label: string; description?: string; value: KycRej
 ];
 
 // Seeded when a case has never had a reviewer checklist saved against it
-// (reviewerChecks starts null in the mock) — the five checks a KYC reviewer
-// works through before deciding a case.
+// (reviewerChecks starts null in the real API) — the five checks a KYC
+// reviewer works through before deciding a case.
 const DEFAULT_CHECKLIST: Array<{ label: string; checked: boolean }> = [
   { label: "Document matches BVN name", checked: false },
   { label: "Face matches liveness capture", checked: false },
@@ -44,37 +36,64 @@ const DEFAULT_CHECKLIST: Array<{ label: string; checked: boolean }> = [
   { label: "No sanctions / PEP hit", checked: false },
 ];
 
-/** Derives the vendor's per-check result grid from the submission's raw
- * checks/flag/documents — the vendor-only fields the design's sidebar shows
- * (BVN lookup / Name / Doc authenticity / Liveness / Sanctions / Duplicate). */
-function vendorResultRows(submission: KycSubmission) {
-  const bvnCheck = submission.checks.find((c) => c.label === "Name matches BVN")?.value ?? "Match";
-  const livenessCheck = submission.checks.find((c) => c.label === "Liveness check")?.value ?? "Passed";
-  const sanctionsCheck = submission.checks.find((c) => c.label.startsWith("Sanctions"))?.value ?? "No hits";
-  const docFlagged = submission.documents.some((d) => d.status === "rejected" || d.status === "expired");
+const DOC_TYPE_LABEL: Record<ApiKycDocumentType, string> = {
+  nin: "NIN",
+  passport: "Passport",
+  drivers_licence: "Driver's licence",
+  resubmission: "Re-submission",
+};
 
+function vendorDecisionLabel(v: ApiKycSubmission["vendorDecision"]) {
+  if (v === "approved") return "approved";
+  if (v === "rejected") return "rejected";
+  return "no decision";
+}
+
+function fmtDate(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function todayDate() {
+  return new Date().toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+}
+
+/** Derives the vendor's per-check result grid from the submission's raw
+ * provider checks — the vendor-only fields the design's sidebar shows. */
+function vendorResultRows(submission: ApiKycSubmission) {
+  const checks = submission.providerChecks ?? {};
+  const fmt = (v?: string) => (v ? v.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) : "Not checked");
+  const bvn = checks.bvnLookup;
   return [
-    { label: "BVN lookup", value: bvnCheck === "Duplicate" ? "Duplicate on file" : bvnCheck },
-    { label: "Name", value: bvnCheck === "Mismatch" ? "Does not match BVN" : "Matches BVN record" },
-    { label: "Doc authenticity", value: docFlagged ? "Flagged for review" : "Passed" },
-    { label: "Liveness", value: livenessCheck },
-    { label: "Sanctions", value: sanctionsCheck },
-    { label: "Duplicate", value: submission.flagReason === "Duplicate BVN" ? "Possible duplicate" : "None found" },
+    { label: "BVN lookup", value: fmt(bvn) },
+    { label: "Name", value: bvn === "match" ? "Matches BVN record" : bvn === "mismatch" ? "Does not match BVN" : fmt(bvn) },
+    { label: "Sanctions / PEP", value: fmt(checks.sanctionsPep) },
+    { label: "Duplicate account", value: fmt(checks.duplicateAccount) },
+    { label: "Liveness match", value: submission.livenessMatchPct != null ? `${submission.livenessMatchPct}%` : "Not captured" },
   ];
 }
 
-/** Constructs a case-history timeline out of the submission's own fields —
- * no extra data needed, just the story the record already tells. */
-function caseTimeline(submission: KycSubmission) {
+/** Constructs a case-history timeline out of the submission's own fields. */
+function caseTimeline(submission: ApiKycSubmission) {
   const items = [
-    { when: submission.submittedAt, what: `Submission received · ${submission.documentType} uploaded` },
-    { when: submission.submittedAt, what: `Flagged for ${submission.flagReason.toLowerCase()} · ${submission.flagDetail}` },
-    submission.vendorDecision === "No decision"
-      ? { when: submission.submittedAt, what: `Vendor returned no decision · confidence ${submission.confidence}` }
-      : { when: submission.submittedAt, what: `Vendor auto-decision: ${submission.vendorDecision} · confidence ${submission.confidence}` },
+    { when: fmtDate(submission.submittedAt), what: `Submission received · ${DOC_TYPE_LABEL[submission.documentType]} uploaded` },
   ];
+  if (submission.flagReason) {
+    items.push({
+      when: fmtDate(submission.submittedAt),
+      what: `Flagged for ${submission.flagReason.toLowerCase()}${submission.flagDetail ? ` · ${submission.flagDetail}` : ""}`,
+    });
+  }
+  items.push({
+    when: fmtDate(submission.submittedAt),
+    what:
+      submission.vendorDecision === "no_decision"
+        ? "Vendor returned no decision"
+        : `Vendor auto-decision: ${vendorDecisionLabel(submission.vendorDecision)}`,
+  });
   if (submission.status === "review" || submission.status === "pending") {
-    items.push({ when: "Now", what: `Waiting on the desk · ${submission.waitingFor} elapsed` });
+    items.push({ when: "Now", what: "Waiting on the desk" });
   }
   return items;
 }
@@ -82,9 +101,11 @@ function caseTimeline(submission: KycSubmission) {
 export default function KycCasePage() {
   const router = useRouter();
   const { id } = useParams<{ id: string }>();
-  const loading = useMockLoading();
 
-  const [submission, setSubmission] = useState<KycSubmission | undefined>(() => getKycSubmissionById(id));
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [submission, setSubmission] = useState<ApiKycSubmission | null>(null);
+
   const [modal, setModal] = useState<null | "approve" | "reject">(null);
   const [reTakeLiveness, setReTakeLiveness] = useState(false);
   const [rejectReasonIndex, setRejectReasonIndex] = useState(0);
@@ -92,11 +113,47 @@ export default function KycCasePage() {
   // Reviewer checklist — draft state for the checklist card. Seeded from the
   // submission's saved reviewerChecks/internalNote, or the default five-item
   // checklist when nobody has saved one yet (reviewerChecks is null).
-  const [checklist, setChecklist] = useState<Array<{ label: string; checked: boolean }>>(
-    () => submission?.reviewerChecks ?? DEFAULT_CHECKLIST.map((c) => ({ ...c })),
+  const [checklist, setChecklist] = useState<Array<{ label: string; checked: boolean }>>(() =>
+    DEFAULT_CHECKLIST.map((c) => ({ ...c })),
   );
-  const [noteDraft, setNoteDraft] = useState(() => submission?.internalNote ?? "");
+  const [noteDraft, setNoteDraft] = useState("");
   const [checklistJustSaved, setChecklistJustSaved] = useState(false);
+  const [savingChecklist, setSavingChecklist] = useState(false);
+  const [deciding, setDeciding] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getKycSubmission(id)
+      .then((s) => {
+        if (!cancelled) setSubmission(s);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 404) {
+          setSubmission(null);
+        } else {
+          setError(err instanceof ApiError ? err.message : "Couldn't load this case.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // Seed the reviewer checklist/note from the freshly loaded submission.
+  useEffect(() => {
+    if (!submission) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setChecklist(submission.reviewerChecks ?? DEFAULT_CHECKLIST.map((c) => ({ ...c })));
+    setNoteDraft(submission.internalNote ?? "");
+    setRejectReasonIndex(0);
+    setReTakeLiveness(false);
+    setModal(null);
+  }, [submission]);
 
   if (loading) {
     return (
@@ -120,6 +177,19 @@ export default function KycCasePage() {
     );
   }
 
+  if (error) {
+    return (
+      <Card
+        title="Couldn't load this case"
+        actions={<Button variant="ghost" size="sm" onClick={() => router.push("/kyc")}>Back to queue</Button>}
+      >
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 460 }}>
+          <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>{error}</span>
+        </div>
+      </Card>
+    );
+  }
+
   if (!submission) {
     return (
       <Card
@@ -140,8 +210,8 @@ export default function KycCasePage() {
   // rather than collecting a second free-text note at decision time.
   const hasSavedNote = (submission.internalNote ?? "").trim().length > 0;
   const isDecided = submission.status === "approved" || submission.status === "rejected";
-  // decideKycSubmission only ever lands a case on the terminal "rejected"
-  // status once attemptCount has hit maxAttempts — see lib/mock/kyc.ts.
+  // decideKyc only ever lands a case on the terminal "rejected" status once
+  // attemptCount has hit maxAttempts — see lib/api/types.ts.
   const isResubmissionLimitReached = submission.status === "rejected";
   const canDecide = hasSavedNote && !isDecided;
 
@@ -153,55 +223,66 @@ export default function KycCasePage() {
     }
   }
 
-  const saveChecklist = () => {
-    const saved = saveKycReviewerChecklist(submission.id, checklist, noteDraft.trim() || null);
-    if (!saved) return;
-    setSubmission({ ...saved });
-    setChecklistJustSaved(true);
-    window.setTimeout(() => setChecklistJustSaved(false), 2400);
+  const saveChecklist = async () => {
+    if (!submission || isDecided) return;
+    setSavingChecklist(true);
+    setActionError(null);
+    try {
+      const saved = await saveKycReviewerChecklist(submission.id, checklist, noteDraft.trim() || null);
+      setSubmission({ ...saved });
+      setChecklistJustSaved(true);
+      window.setTimeout(() => setChecklistJustSaved(false), 2400);
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Couldn't save the checklist.");
+    } finally {
+      setSavingChecklist(false);
+    }
   };
 
-  const confirmApprove = () => {
-    if (!canDecide) return;
-    const decided = decideKycSubmission(submission.id, "approved");
-    if (!decided) return;
-    recordKycOverride({
-      submissionId: decided.id,
-      clientName: decided.name,
-      decision: "approved",
-      reason: (decided.internalNote ?? "").trim(),
-      staffName: STAFF_NAME,
-    });
-    pushQueueToast({
-      title: "Case approved",
-      message: `${decided.name} is now verified at ${decided.tier}. Override logged against ${STAFF_NAME}.`,
-    });
-    setModal(null);
-    router.push("/kyc");
+  const confirmApprove = async () => {
+    if (!submission || !canDecide) return;
+    setDeciding(true);
+    setActionError(null);
+    try {
+      const decided = await decideKyc(submission.id, "approve");
+      pushQueueToast({
+        title: "Case approved",
+        message: `${decided.name} is now verified at ${decided.tier}. Override logged against your name.`,
+      });
+      setModal(null);
+      router.push("/kyc");
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Couldn't approve this case.");
+      setDeciding(false);
+    }
   };
 
-  const confirmReject = () => {
-    if (!canDecide) return;
-    const reason = REJECT_REASONS[rejectReasonIndex];
-    const decided = decideKycSubmission(submission.id, "rejected", reason.value);
-    if (!decided) return;
-    recordKycOverride({
-      submissionId: decided.id,
-      clientName: decided.name,
-      decision: "rejected",
-      reason: `${reason.label} — ${(decided.internalNote ?? "").trim()}`,
-      staffName: STAFF_NAME,
-    });
-    pushQueueToast({
-      title: "Case rejected",
-      message:
-        decided.status === "rejected"
-          ? `${decided.name} has used all ${decided.maxAttempts} attempts. The case is now closed. Override logged against ${STAFF_NAME}.`
-          : `${decided.name} was rejected and asked to re-submit (attempt ${decided.attemptCount} of ${decided.maxAttempts}). Override logged against ${STAFF_NAME}.`,
-    });
-    setModal(null);
-    router.push("/kyc");
+  const confirmReject = async () => {
+    if (!submission || !canDecide) return;
+    setDeciding(true);
+    setActionError(null);
+    try {
+      const reason = REJECT_REASONS[rejectReasonIndex];
+      const decided = await decideKyc(submission.id, "reject", reason.value);
+      pushQueueToast({
+        title: "Case rejected",
+        message:
+          decided.status === "rejected"
+            ? `${decided.name} has used all ${decided.maxAttempts} attempts. The case is now closed. Override logged against your name.`
+            : `${decided.name} was rejected and asked to re-submit (attempt ${decided.attemptCount} of ${decided.maxAttempts}). Override logged against your name.`,
+      });
+      setModal(null);
+      router.push("/kyc");
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Couldn't reject this case.");
+      setDeciding(false);
+    }
   };
+
+  const vendorWord =
+    submission.vendorDecision === "no_decision" ? "No auto-decision" : `Vendor ${vendorDecisionLabel(submission.vendorDecision)}`;
+  const flagWord = submission.flagReason ? submission.flagReason.toLowerCase() : "manual review";
+  const confidenceWord = submission.livenessMatchPct != null ? ` · confidence ${submission.livenessMatchPct}%` : "";
 
   return (
     <>
@@ -224,7 +305,7 @@ export default function KycCasePage() {
             </span>
           </span>
         }
-        description={`Case ${submission.id} · ${submission.documentType} · ${submission.tier} · submitted ${submission.submittedAt} · ${submission.city} · waiting ${submission.waitingFor}`}
+        description={`Case ${submission.id} · ${DOC_TYPE_LABEL[submission.documentType]} · ${submission.tier} · submitted ${fmtDate(submission.submittedAt)} · ${submission.city}`}
         onBack={() => router.push("/kyc")}
         actions={
           <>
@@ -234,7 +315,10 @@ export default function KycCasePage() {
             <Button
               variant="secondary"
               size="sm"
-              onClick={() => setModal("reject")}
+              onClick={() => {
+                setActionError(null);
+                setModal("reject");
+              }}
               disabled={!canDecide}
               title={isDecided ? "This case has already been decided" : !hasSavedNote ? "Save a reviewer checklist note before deciding" : undefined}
             >
@@ -243,7 +327,10 @@ export default function KycCasePage() {
             <Button
               size="sm"
               iconLeft="check"
-              onClick={() => setModal("approve")}
+              onClick={() => {
+                setActionError(null);
+                setModal("approve");
+              }}
               disabled={!canDecide}
               title={isDecided ? "This case has already been decided" : !hasSavedNote ? "Save a reviewer checklist note before deciding" : undefined}
             >
@@ -271,18 +358,16 @@ export default function KycCasePage() {
         <Icon name="alert" size={17} color="var(--indicator)" />
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           <span style={{ font: "var(--text-card-title)", fontWeight: 600, color: "var(--indicator)" }}>
-            {submission.vendorDecision === "No decision"
-              ? `No auto-decision · ${submission.flagReason.toLowerCase()} · confidence ${submission.confidence}`
-              : `Vendor ${submission.vendorDecision.toLowerCase()} · ${submission.flagReason.toLowerCase()} · confidence ${submission.confidence}`}
+            {`${vendorWord} · ${flagWord}${confidenceWord}`}
           </span>
           <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>
-            {`Vendor run ${submission.submittedAt} · ${submission.vendorDetail}. A desk decision here is an override and is logged against your name.`}
+            {`${submission.vendorDetail ?? "Vendor run on record."} A desk decision here is an override and is logged against your name.`}
           </span>
         </div>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 340px", gap: 20, alignItems: "start" }}>
-        <Card eyebrow="Submitted documents" title={submission.documents[0]?.name ?? "Documents"}>
+        <Card eyebrow="Submitted documents" title={submission.documents[0]?.documentName ?? "Documents"}>
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div
               style={{
@@ -297,14 +382,42 @@ export default function KycCasePage() {
               }}
             >
               <Icon name="doc" size={32} color="var(--ink-3)" />
-              <span style={{ font: "var(--text-data)", color: "var(--ink-2)" }}>{submission.documents[0]?.name ?? "No document on file"}</span>
-              <span style={{ font: "var(--text-micro)", letterSpacing: "var(--track-micro)", textTransform: "uppercase", color: "var(--ink-3)" }}>
-                {submission.documents[0]?.meta ?? ""}
-              </span>
+              <span style={{ font: "var(--text-data)", color: "var(--ink-2)" }}>{submission.documents[0]?.documentName ?? "No document on file"}</span>
+              {submission.documents[0] ? (
+                <span style={{ font: "var(--text-micro)", letterSpacing: "var(--track-micro)", textTransform: "uppercase", color: "var(--ink-3)" }}>
+                  {`${submission.documents[0].documentKind} · ${fmtDate(submission.documents[0].uploadedAt)}`}
+                </span>
+              ) : null}
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {submission.documents.map((doc) => (
-                <DocumentPreview key={doc.name} document={doc} />
+                <div
+                  key={doc.id}
+                  style={{ background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-card)", padding: 16, display: "flex", alignItems: "center", gap: 12 }}
+                >
+                  <span
+                    style={{
+                      width: 40,
+                      height: 48,
+                      flex: "0 0 auto",
+                      borderRadius: 8,
+                      background: "var(--bg)",
+                      border: "1px solid var(--hairline)",
+                      display: "grid",
+                      placeItems: "center",
+                    }}
+                  >
+                    <Icon name="doc" size={20} color="var(--ink-3)" />
+                  </span>
+                  <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+                    <span style={{ font: "var(--text-card-title)", color: "var(--ink)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {doc.documentName}
+                    </span>
+                    <span style={{ font: "var(--text-micro)", letterSpacing: "var(--track-micro)", color: "var(--ink-3)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {`${doc.documentKind} · ${fmtDate(doc.uploadedAt)}`}
+                    </span>
+                  </span>
+                </div>
               ))}
             </div>
           </div>
@@ -330,7 +443,7 @@ export default function KycCasePage() {
               </span>
             </div>
             <div style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>
-              {submission.vendorDetail}. Document photo and capture were reviewed by the vendor before this case reached the desk.
+              {submission.vendorDetail ?? "Vendor run on record."} The document photo and capture were reviewed by the vendor before this case reached the desk.
             </div>
           </div>
 
@@ -369,8 +482,11 @@ export default function KycCasePage() {
               onChange={(e) => setNoteDraft(e.target.value)}
               disabled={isDecided}
             />
+            {actionError && !modal ? (
+              <span style={{ font: "var(--text-micro)", color: "var(--loss)" }}>{actionError}</span>
+            ) : null}
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <Button variant="secondary" size="sm" onClick={saveChecklist} disabled={isDecided}>
+              <Button variant="secondary" size="sm" onClick={saveChecklist} disabled={isDecided || savingChecklist} loading={savingChecklist}>
                 Save checklist
               </Button>
               {checklistJustSaved ? (
@@ -410,10 +526,26 @@ export default function KycCasePage() {
           )}
         </div>
         <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-          <Button variant="secondary" size="md" onClick={() => setModal("reject")} disabled={!canDecide}>
+          <Button
+            variant="secondary"
+            size="md"
+            onClick={() => {
+              setActionError(null);
+              setModal("reject");
+            }}
+            disabled={!canDecide}
+          >
             Reject
           </Button>
-          <Button size="md" iconLeft="check" onClick={() => setModal("approve")} disabled={!canDecide}>
+          <Button
+            size="md"
+            iconLeft="check"
+            onClick={() => {
+              setActionError(null);
+              setModal("approve");
+            }}
+            disabled={!canDecide}
+          >
             Approve
           </Button>
         </div>
@@ -425,21 +557,24 @@ export default function KycCasePage() {
         onClose={() => setModal(null)}
         footer={
           <>
-            <Button variant="ghost" size="md" onClick={() => setModal(null)}>
+            <Button variant="ghost" size="md" onClick={() => setModal(null)} disabled={deciding}>
               Cancel
             </Button>
-            <Button size="md" iconLeft="check" disabled={!canDecide} onClick={confirmApprove}>
+            <Button size="md" iconLeft="check" disabled={!canDecide || deciding} loading={deciding} onClick={confirmApprove}>
               Approve and notify
             </Button>
           </>
         }
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {actionError && modal === "approve" ? (
+            <span style={{ font: "var(--text-micro)", color: "var(--loss)" }}>{actionError}</span>
+          ) : null}
           <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>
             {`This approves the account for trading at ${submission.tier} and notifies the client. ${
-              submission.vendorDecision === "No decision"
-                ? `You are overriding the vendor, which returned no decision at ${submission.confidence} confidence.`
-                : `You are overriding the vendor's ${submission.vendorDecision.toLowerCase()} result (confidence ${submission.confidence}).`
+              submission.vendorDecision === "no_decision"
+                ? `You are overriding the vendor, which returned no decision${confidenceWord}.`
+                : `You are overriding the vendor's ${vendorDecisionLabel(submission.vendorDecision)} result${confidenceWord}.`
             }`}
           </span>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "12px 14px", background: "var(--bg)", borderRadius: "var(--r-input)" }}>
@@ -450,7 +585,7 @@ export default function KycCasePage() {
           <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 14px", background: "var(--bg)", borderRadius: "var(--r-input)" }}>
             <Icon name="shield" size={16} color="var(--ink-3)" />
             <span style={{ font: "var(--text-micro)", letterSpacing: "var(--track-micro)", textTransform: "uppercase", color: "var(--ink-3)" }}>
-              {`Logged as an override · case ${submission.id} · ${CASE_LOG_DATE}`}
+              {`Logged as an override · case ${submission.id} · ${todayDate()}`}
             </span>
           </div>
         </div>
@@ -462,16 +597,19 @@ export default function KycCasePage() {
         onClose={() => setModal(null)}
         footer={
           <>
-            <Button variant="ghost" size="md" onClick={() => setModal(null)}>
+            <Button variant="ghost" size="md" onClick={() => setModal(null)} disabled={deciding}>
               Cancel
             </Button>
-            <Button size="md" disabled={!canDecide} onClick={confirmReject}>
+            <Button size="md" disabled={!canDecide || deciding} loading={deciding} onClick={confirmReject}>
               Reject and notify
             </Button>
           </>
         }
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {actionError && modal === "reject" ? (
+            <span style={{ font: "var(--text-micro)", color: "var(--loss)" }}>{actionError}</span>
+          ) : null}
           <span style={{ font: "var(--text-body)", color: "var(--ink-2)" }}>
             {submission.attemptCount + 1 >= submission.maxAttempts
               ? `This is the client's final attempt (${submission.attemptCount + 1} of ${submission.maxAttempts}). Rejecting now closes the case — the client cannot re-submit again.`

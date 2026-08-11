@@ -1,12 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import type { Transaction } from "@/types/api";
-import { getTransactions } from "@/lib/mock/transactions";
-import { useMockLoading } from "@/lib/useMockLoading";
+import type { ApiTransaction, ApiTransactionStatus, ApiTransactionType } from "@/lib/api/types";
+import { listTransactions, listUsers, ApiError } from "@/lib/api/client";
+import { StatusPill, type Status } from "@/components/ui/StatusPill";
 import { DataTable, DataTableColumn, TwoLineCell } from "@/components/ui/DataTable";
-import { StatusPill } from "@/components/ui/StatusPill";
 import { Pagination } from "@/components/ui/Pagination";
 import { PageHead } from "@/components/ui/PageHead";
 import { SearchPill } from "@/components/ui/SearchPill";
@@ -14,95 +13,132 @@ import { Select } from "@/components/ui/Select";
 import { Button } from "@/components/ui/Button";
 import { SkeletonTable, SkeletonCard } from "@/components/ui/Skeleton";
 import { StatCard } from "@/components/ui/StatCard";
+import { signedKoboToNaira, koboToNaira } from "@/lib/money";
 
 const PER_PAGE = 12;
-const TODAY = "2026-03-14";
-const YESTERDAY = "2026-03-13";
+// Cap for the separate "stats" fetch below — the monitor's headline numbers
+// are computed server-side totals over a bounded page; real volumes larger
+// than this only understate "today"/"held", never crash.
+const STATS_CAP = 500;
+// Cap for resolving transaction userId -> client name/email.
+const LOOKUP_CAP = 500;
 
-type TypeFilter = "all" | Transaction["type"];
-type StatusFilter = "all" | Transaction["status"];
+type TypeFilter = "all" | ApiTransactionType;
+type StatusFilter = "all" | ApiTransactionStatus;
 type DatePreset = "today" | "7" | "30" | "all";
 
-const TYPE_OPTIONS = [
-  { value: "all" as TypeFilter, label: "All types" },
-  { value: "Buy", label: "Buy" },
-  { value: "Sell", label: "Sell" },
-  { value: "Deposit", label: "Deposit" },
-  { value: "Withdrawal", label: "Withdrawal" },
+const TYPE_OPTIONS: { value: TypeFilter; label: string }[] = [
+  { value: "all", label: "All types" },
+  { value: "buy", label: "Buy" },
+  { value: "sell", label: "Sell" },
+  { value: "fund", label: "Deposit" },
+  { value: "withdraw", label: "Withdrawal" },
+  { value: "convert", label: "Convert" },
 ];
 
-// Order matches the design's monitorBar options exactly: All statuses,
-// Settled, Pending, Held, Failed.
-const STATUS_OPTIONS = [
-  { value: "all" as StatusFilter, label: "All statuses" },
+// All 7 real statuses — wider than the mock's 4-value set. Labels follow the
+// design's monitorBar copy where one exists (settled/held/failed).
+const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
+  { value: "all", label: "All statuses" },
   { value: "approved", label: "Settled" },
+  { value: "completed", label: "Completed" },
   { value: "pending", label: "Pending" },
   { value: "review", label: "Held" },
-  { value: "rejected", label: "Failed" },
+  { value: "flagged", label: "Flagged" },
+  { value: "rejected", label: "Rejected" },
+  { value: "failed", label: "Failed" },
 ];
 
-const DATE_OPTIONS = [
-  { value: "today" as DatePreset, label: "Today" },
-  { value: "7" as DatePreset, label: "Last 7 days" },
-  { value: "30" as DatePreset, label: "Last 30 days" },
-  { value: "all" as DatePreset, label: "1–14 Mar 2026" },
+const DATE_OPTIONS: { value: DatePreset; label: string }[] = [
+  { value: "today", label: "Today" },
+  { value: "7", label: "Last 7 days" },
+  { value: "30", label: "Last 30 days" },
+  { value: "all", label: "All time" },
 ];
 
-// Fixed mock anchor date is 14 Mar 2026 (Tuesday) — matches design frame 6a's
-// PageHead eyebrow. 6c's "no matches" frame shows the eyebrow as the active
-// range instead, so the eyebrow tracks whichever date preset is selected.
-const EYEBROW: Record<DatePreset, string> = {
-  today: "Tuesday, 14 March 2026",
-  "7": "8–14 March 2026",
-  "30": "13 February – 14 March 2026",
-  all: "1–14 March 2026",
+// "failed" isn't a StatusPill tone — render it as rejected-coloured with the
+// design's "Failed" label. approved renders as "Settled", completed as-is.
+const STATUS_PILL: Record<ApiTransactionStatus, { status: Status; label: string }> = {
+  pending: { status: "pending", label: "Pending" },
+  review: { status: "review", label: "Held" },
+  flagged: { status: "flagged", label: "Flagged" },
+  approved: { status: "approved", label: "Settled" },
+  completed: { status: "completed", label: "Completed" },
+  rejected: { status: "rejected", label: "Rejected" },
+  failed: { status: "rejected", label: "Failed" },
 };
 
-const TYPE_PLURAL: Record<Transaction["type"], string> = {
-  Buy: "buys",
-  Sell: "sells",
-  Deposit: "deposits",
-  Withdrawal: "withdrawals",
-  Convert: "converts",
+const TYPE_LABEL: Record<ApiTransactionType, string> = {
+  fund: "Deposit",
+  withdraw: "Withdrawal",
+  buy: "Buy",
+  sell: "Sell",
+  convert: "Convert",
+};
+
+function statusPill(t: ApiTransaction) {
+  const pill = STATUS_PILL[t.status] ?? STATUS_PILL.pending;
+  return <StatusPill status={pill.status} label={pill.label} size="sm" />;
+}
+
+function fmtWhen(iso: string) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const time = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
+  const date = d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+  return `${time} · ${date}`;
+}
+
+function shortId(id: string) {
+  return id.slice(0, 8);
+}
+
+/** Date windows computed against "now" — no fixed mock anchor. */
+function datePresetWindow(preset: DatePreset) {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (preset === "today") return { min: startOfToday, max: now };
+  if (preset === "7") return { min: new Date(startOfToday.getTime() - 6 * 86400000), max: now };
+  if (preset === "30") return { min: new Date(startOfToday.getTime() - 29 * 86400000), max: now };
+  return { min: new Date(0), max: now };
+}
+
+/** Abbreviates to the design's "₦482.61M" style once a figure clears ₦1M;
+ * smaller sums print in full. The input is integer kobo, so the naira figure
+ * is kobo/100 and the "M" threshold is ₦1,000,000 (100,000,000 kobo). */
+function compactNaira(kobo: number) {
+  const naira = Math.abs(kobo) / 100;
+  if (naira >= 1_000_000) return `₦${(naira / 1_000_000).toFixed(2)}M`;
+  return koboToNaira(kobo);
+}
+
+const TYPE_WORD: Record<ApiTransactionType, string> = {
+  fund: "deposits",
+  withdraw: "withdrawals",
+  buy: "buys",
+  sell: "sells",
+  convert: "converts",
 };
 
 const STATUS_WORD: Record<Exclude<StatusFilter, "all">, string> = {
-  approved: "settled",
   pending: "pending",
   review: "held",
-  rejected: "failed",
+  flagged: "flagged",
+  approved: "settled",
   completed: "completed",
+  rejected: "rejected",
+  failed: "failed",
 };
 
 const DATE_CLAUSE: Record<DatePreset, string> = {
   today: "today",
   "7": "in the last 7 days",
   "30": "in the last 30 days",
-  all: "between 1 and 14 Mar 2026",
+  all: "on record",
 };
 
-function statusPill(t: Transaction) {
-  return <StatusPill status={t.status} label={t.statusLabel} size="sm" />;
-}
-
-function amountToNumber(a: string) {
-  const sign = a.startsWith("−") || a.startsWith("-") ? -1 : 1;
-  return sign * parseFloat(a.replace(/[^\d.]/g, ""));
-}
-
-function fmtNaira(n: number) {
-  return `₦${n.toLocaleString("en-NG", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-/** Abbreviates to the design's "₦482.61M" style once a figure clears ₦1M;
- * smaller sums (this mock's actual scale) print in full. */
-function compactNaira(n: number) {
-  if (Math.abs(n) >= 1_000_000) return `₦${(n / 1_000_000).toFixed(2)}M`;
-  return fmtNaira(n);
-}
-
 function buildEmptyMessage(type: TypeFilter, status: StatusFilter, date: DatePreset, query: string) {
-  const typeWord = type !== "all" ? TYPE_PLURAL[type as Transaction["type"]] : "transactions";
+  const typeWord = type !== "all" ? TYPE_WORD[type as ApiTransactionType] : "transactions";
   const statusWord = status !== "all" ? STATUS_WORD[status as Exclude<StatusFilter, "all">] : "";
   const subject = statusWord ? `${statusWord} ${typeWord}` : typeWord;
   const queryClause = query.trim() ? ` for "${query.trim()}"` : "";
@@ -128,7 +164,6 @@ function NoMatches({ message, onClear, onResetToday }: { message: string; onClea
 
 export default function TransactionsPage() {
   const router = useRouter();
-  const loading = useMockLoading();
 
   const [type, setType] = useState<TypeFilter>("all");
   const [status, setStatus] = useState<StatusFilter>("all");
@@ -138,8 +173,91 @@ export default function TransactionsPage() {
   const [sortKey, setSortKey] = useState<"client" | "on" | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
-  // SEAM: replace with GET /api/admin/transactions
-  const transactions = useMemo(() => getTransactions(), []);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [transactions, setTransactions] = useState<ApiTransaction[]>([]);
+  const [total, setTotal] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+
+  const [usersById, setUsersById] = useState<Map<string, { name: string; email: string }>>(new Map());
+  const [allTx, setAllTx] = useState<ApiTransaction[]>([]);
+
+  // Manual refresh — increments the tick the fetch effects depend on so the
+  // Refresh button re-runs the live fetches instead of no-op'ing on identical
+  // filter state. `refreshing` feeds the button's disabled state.
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const refresh = () => {
+    setRefreshing(true);
+    setRefreshTick((t) => t + 1);
+  };
+
+  // The monitor — type/status are server-side filters (the endpoint supports
+  // them directly); search and the date preset filter client-side on the
+  // fetched page, since there's no date param on GET /transactions.
+  useEffect(() => {
+    let cancelled = false;
+    listTransactions({
+      page,
+      pageSize: PER_PAGE,
+      type: type === "all" ? undefined : type,
+      status: status === "all" ? undefined : status,
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setTransactions(res.data);
+        setTotal(res.meta.total);
+        setTotalPages(res.meta.totalPages);
+        setError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? err.message : "Couldn't load transactions.");
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [page, type, status, refreshTick]);
+
+  // Stats strip — a bounded look across all transactions so the headline
+  // numbers (volume today, held, failed) are page-independent.
+  useEffect(() => {
+    let cancelled = false;
+    listTransactions({ page: 1, pageSize: STATS_CAP })
+      .then((res) => {
+        if (!cancelled) setAllTx(res.data);
+      })
+      .catch(() => {
+        // stats are best-effort; the monitor still renders
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshTick]);
+
+  // Client-name resolution for the Client column — the real transaction
+  // carries userId but no client name, so a capped users lookup fills it.
+  useEffect(() => {
+    let cancelled = false;
+    listUsers({ page: 1, pageSize: LOOKUP_CAP })
+      .then((res) => {
+        if (cancelled) return;
+        setUsersById(new Map(res.data.map((u) => [u.id, { name: u.fullName, email: u.email }])));
+      })
+      .catch(() => {
+        // name is a display nicety only — fall back to the raw userId
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const clearFilters = () => {
     setType("all");
@@ -154,59 +272,65 @@ export default function TransactionsPage() {
     setPage(1);
   };
 
+  const clientName = (t: ApiTransaction) => usersById.get(t.userId)?.name ?? t.userId;
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    let list = transactions;
-
-    if (type !== "all") list = list.filter((t) => t.type === type);
-    if (status !== "all") list = list.filter((t) => t.status === status);
-    if (date === "today") list = list.filter((t) => t.on === TODAY);
-    if (date === "7") list = list.filter((t) => t.on >= "2026-03-08");
-    if (date === "30") list = list.filter((t) => t.on >= "2026-02-13");
-    if (q) list = list.filter((t) => t.userName.toLowerCase().includes(q) || t.userId.toLowerCase().includes(q) || t.id.toLowerCase().includes(q));
-
-    return list;
-  }, [transactions, type, status, date, query]);
+    const { min, max } = datePresetWindow(date);
+    return transactions.filter((t) => {
+      const at = new Date(t.createdAt);
+      if (at < min || at > max) return false;
+      if (q && !(clientName(t).toLowerCase().includes(q) || t.userId.toLowerCase().includes(q) || t.id.toLowerCase().includes(q) || t.title.toLowerCase().includes(q))) return false;
+      return true;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transactions, query, date, usersById]);
 
   const sortableList = useMemo(() => {
     const sorted = [...filtered].sort((a, b) => {
       if (!sortKey) return 0;
-      let av: string, bv: string;
       if (sortKey === "client") {
-        av = a.userName;
-        bv = b.userName;
-      } else {
-        const at = a.on + a.when.split(" · ")[0];
-        const bt = b.on + b.when.split(" · ")[0];
-        av = at;
-        bv = bt;
+        const cmp = clientName(a).localeCompare(clientName(b), undefined, { numeric: true });
+        return sortDir === "asc" ? cmp : -cmp;
       }
-      const cmp = av.localeCompare(bv, undefined, { numeric: true });
+      const cmp = a.createdAt.localeCompare(b.createdAt);
       return sortDir === "asc" ? cmp : -cmp;
     });
     return sorted;
-  }, [filtered, sortKey, sortDir]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filtered, sortKey, sortDir, usersById]);
 
-  const pageCount = Math.max(1, Math.ceil(sortableList.length / PER_PAGE));
-  const safePage = Math.min(page, pageCount);
-  const rows = sortableList.slice((safePage - 1) * PER_PAGE, safePage * PER_PAGE);
+  const safePage = Math.min(page, totalPages);
+  const rows = sortableList;
 
   const stats = useMemo(() => {
-    const todayTx = transactions.filter((t) => t.on === TODAY);
-    const yestTx = transactions.filter((t) => t.on === YESTERDAY);
-    const gross = (list: Transaction[]) => list.reduce((s, t) => s + Math.abs(amountToNumber(t.amount)), 0);
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfYesterday = new Date(startOfToday.getTime() - 86400000);
+    const inDay = (t: ApiTransaction, start: Date, end: Date) => {
+      const at = new Date(t.createdAt);
+      return at >= start && at < end;
+    };
+    const inDayNamed = (t: ApiTransaction, start: Date, end: Date) => {
+      const at = new Date(t.createdAt);
+      return at >= start && at < end;
+    };
+
+    const todayTx = allTx.filter((t) => inDay(t, startOfToday, new Date(now.getTime() + 86400000)));
+    const yestTx = allTx.filter((t) => inDayNamed(t, startOfYesterday, startOfToday));
+    const gross = (list: ApiTransaction[]) => list.reduce((s, t) => s + Math.abs(t.amountKobo), 0);
     const volToday = gross(todayTx);
     const volYest = gross(yestTx);
     const pct = volYest ? ((volToday - volYest) / volYest) * 100 : 0;
 
-    const ordersLiveToday = todayTx.filter((t) => (t.type === "Buy" || t.type === "Sell") && t.status !== "approved").length;
+    const ordersLiveToday = todayTx.filter((t) => (t.type === "buy" || t.type === "sell") && t.status !== "approved" && t.status !== "completed").length;
 
-    const held = transactions.filter((t) => t.status === "review");
-    const heldValue = held.reduce((s, t) => s + Math.abs(amountToNumber(t.amount)), 0);
-    const aboveTier = held.filter((t) => t.holdingRule === "Above tier limit").length;
+    const held = allTx.filter((t) => t.status === "review");
+    const heldValue = held.reduce((s, t) => s + Math.abs(t.amountKobo), 0);
+    const aboveTier = held.filter((t) => t.holdingRule && /tier|limit/i.test(t.holdingRule)).length;
 
-    const failedToday = todayTx.filter((t) => t.status === "rejected").length;
-    const failedYest = yestTx.filter((t) => t.status === "rejected").length;
+    const failedToday = todayTx.filter((t) => t.status === "rejected" || t.status === "failed").length;
+    const failedYest = yestTx.filter((t) => t.status === "rejected" || t.status === "failed").length;
     const failedDiff = failedToday - failedYest;
 
     return {
@@ -220,21 +344,19 @@ export default function TransactionsPage() {
       failedToday,
       failedDiff,
     };
-  }, [transactions]);
+  }, [allTx]);
 
   const exportCsv = () => {
-    const header = ["Reference", "Client", "User ID", "Type", "Asset", "Units", "Unit price", "Amount", "Status", "Timestamp"];
+    const header = ["Reference", "Client", "User ID", "Type", "Detail", "Amount", "Status", "Timestamp"];
     const lines = sortableList.map((t) => [
       t.id,
-      t.userName,
+      clientName(t),
       t.userId,
-      t.type,
-      t.asset === "—" ? "—" : `${t.asset} · ${t.units ?? ""} @ ${t.unitPrice ?? ""}`,
-      t.units ?? "",
-      t.unitPrice ?? "",
-      t.amount,
-      t.statusLabel,
-      t.when,
+      TYPE_LABEL[t.type],
+      `${t.title} · ${t.subtitle}`,
+      String(t.amountKobo),
+      t.status,
+      fmtWhen(t.createdAt),
     ]);
     const csv = [header, ...lines].map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
@@ -248,39 +370,89 @@ export default function TransactionsPage() {
 
   const onSort = (key: string) => {
     if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    else { setSortKey(key as "client" | "on"); setSortDir("asc"); }
+    else {
+      setSortKey(key as "client" | "on");
+      setSortDir("asc");
+    }
   };
 
   const GRID = "minmax(0, 1.6fr) minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.3fr)";
 
-  const columns: DataTableColumn<Transaction>[] = [
-    { key: "client", label: "Client", sortable: true, render: (t) => <TwoLineCell primary={t.userName} secondary={t.userId} /> },
-    { key: "type", label: "Type", render: (t) => t.type },
-    { key: "asset", label: "Asset", render: (t) => t.asset === "—" ? "—" : <span className="k-tnum">{`${t.asset} · ${t.units} @ ${t.unitPrice}`}</span> },
-    { key: "id", label: "Reference", render: (t) => <span className="k-tnum">{t.id}</span> },
+  const columns: DataTableColumn<ApiTransaction>[] = [
+    { key: "client", label: "Client", sortable: true, render: (t) => <TwoLineCell primary={clientName(t)} secondary={shortId(t.userId)} /> },
+    { key: "type", label: "Type", render: (t) => TYPE_LABEL[t.type] ?? t.type },
+    {
+      key: "detail",
+      label: "Detail",
+      render: (t) => (t.title || t.subtitle ? <TwoLineCell primary={t.title} secondary={t.subtitle} /> : <span>—</span>),
+    },
+    { key: "id", label: "Reference", render: (t) => <span className="k-tnum">{shortId(t.id)}</span> },
     {
       key: "amount",
       label: "Amount",
       align: "right",
       render: (t) => (
-        <span className="k-tnum" style={{ font: "var(--text-data)", fontWeight: 500, color: t.tone === "gain" ? "var(--gain)" : "var(--loss)" }}>
-          {t.amount}
+        <span className="k-tnum" style={{ font: "var(--text-data)", fontWeight: 500, color: t.amountKobo < 0 ? "var(--loss)" : "var(--gain)" }}>
+          {signedKoboToNaira(t.amountKobo)}
         </span>
       ),
     },
     { key: "status", label: "Status", render: statusPill },
-    { key: "on", label: "Timestamp", align: "right", sortable: true, render: (t) => <span className="k-tnum">{t.when}</span> },
+    { key: "on", label: "Timestamp", align: "right", sortable: true, render: (t) => <span className="k-tnum">{fmtWhen(t.createdAt)}</span> },
   ];
 
-  // Toolbar order matches the design's monitorBar exactly: search first,
-  // then type/status/date filters, then the CSV export pinned right.
+  const todayRangeLabel = (() => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const fmt = (d: Date) => d.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
+    if (date === "today") {
+      return now.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+    }
+    if (date === "7") return `${fmt(new Date(startOfToday.getTime() - 6 * 86400000))} – ${fmt(now)}`;
+    if (date === "30") return `${fmt(new Date(startOfToday.getTime() - 29 * 86400000))} – ${fmt(now)}`;
+    return "All time";
+  })();
+
   const toolbar = (
     <>
       <SearchPill value={query} onChange={setQuery} placeholder="Search client or reference" width={260} />
-      <Select aria-label="Filter by type" value={type} onChange={(v) => setType(v as TypeFilter)} height={36} width={150} options={TYPE_OPTIONS} />
-      <Select aria-label="Filter by status" value={status} onChange={(v) => setStatus(v as StatusFilter)} height={36} width={160} options={STATUS_OPTIONS} />
-      <Select aria-label="Filter by date" value={date} onChange={(v) => setDate(v as DatePreset)} height={36} width={176} options={DATE_OPTIONS} />
-      <div style={{ marginLeft: "auto" }}>
+      <Select
+        aria-label="Filter by type"
+        value={type}
+        onChange={(v) => {
+          setType(v as TypeFilter);
+          setPage(1);
+        }}
+        height={36}
+        width={150}
+        options={TYPE_OPTIONS}
+      />
+      <Select
+        aria-label="Filter by status"
+        value={status}
+        onChange={(v) => {
+          setStatus(v as StatusFilter);
+          setPage(1);
+        }}
+        height={36}
+        width={160}
+        options={STATUS_OPTIONS}
+      />
+      <Select
+        aria-label="Filter by date"
+        value={date}
+        onChange={(v) => {
+          setDate(v as DatePreset);
+          setPage(1);
+        }}
+        height={36}
+        width={176}
+        options={DATE_OPTIONS}
+      />
+      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+        <Button variant="ghost" size="sm" iconLeft="refresh" onClick={refresh} disabled={refreshing}>
+          Refresh
+        </Button>
         <Button variant="secondary" size="sm" iconLeft="download" onClick={exportCsv}>
           Export CSV
         </Button>
@@ -288,10 +460,31 @@ export default function TransactionsPage() {
     </>
   );
 
+  if (error) {
+    return (
+      <>
+        <PageHead
+          eyebrow={todayRangeLabel}
+          title="Transactions and orders"
+          description="Every buy, sell, deposit and withdrawal across the book. Held rows are waiting on the desk."
+        />
+        <div style={{ padding: "56px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 8, textAlign: "center", background: "var(--paper)", border: "1px solid var(--hairline)", borderRadius: "var(--r-card)" }}>
+          <span style={{ font: "var(--text-section)", letterSpacing: "var(--track-section)", color: "var(--ink)" }}>
+            Couldn&apos;t load transactions
+          </span>
+          <span style={{ font: "var(--text-body)", color: "var(--ink-2)", maxWidth: 340 }}>{error}</span>
+          <Button variant="secondary" size="sm" iconLeft="refresh" onClick={refresh} disabled={refreshing} style={{ marginTop: 10 }}>
+            Try again
+          </Button>
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <PageHead
-        eyebrow={EYEBROW[date]}
+        eyebrow={todayRangeLabel}
         title="Transactions and orders"
         description="Every buy, sell, deposit and withdrawal across the book. Held rows are waiting on the desk."
       />
@@ -320,8 +513,8 @@ export default function TransactionsPage() {
             />
             <StatCard
               label="Held for review"
-              value={`${stats.heldCount} · ${compactNaira(stats.heldValue)}`}
-              sub={`${stats.aboveTier} above tier limit`}
+              value={compactNaira(stats.heldValue)}
+              sub={`${stats.heldCount} held · ${stats.aboveTier} above tier limit`}
               subTone={stats.aboveTier > 0 ? "loss" : "neutral"}
             />
             <StatCard
@@ -344,8 +537,8 @@ export default function TransactionsPage() {
             toolbar={toolbar}
             gridTemplateColumns={GRID}
             footer={
-              sortableList.length > PER_PAGE ? (
-                <Pagination page={safePage} pageCount={pageCount} total={sortableList.length} perPage={PER_PAGE} onChange={setPage} />
+              total > PER_PAGE ? (
+                <Pagination page={safePage} pageCount={totalPages} total={total} perPage={PER_PAGE} onChange={setPage} />
               ) : null
             }
           />

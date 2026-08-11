@@ -85,6 +85,7 @@ export default function LoginPage() {
   const [view, setView] = useState<View>("sign-in");
   const [email, setEmail] = useState(DEMO_EMAIL);
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [trustDevice, setTrustDevice] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -179,8 +180,26 @@ export default function LoginPage() {
               />
               <Input
                 label="Password"
-                type="password"
+                type={showPassword ? "text" : "password"}
                 prefix={<Icon name="lock" size={16} color="var(--ink-3)" />}
+                suffix={
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      cursor: "pointer",
+                      padding: 0,
+                      display: "grid",
+                      placeItems: "center",
+                      color: "var(--ink-3)",
+                    }}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                  >
+                    <Icon name={showPassword ? "eyeOff" : "eye"} size={18} />
+                  </button>
+                }
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 error={error ? "Check the password and try again." : undefined}
